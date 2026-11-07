@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>线性代数 第3讲 向量组的线性相关性_哔哩哔哩_bilibili</title>
+<!--
+  开发自测页：不用装扩展，直接在浏览器里跑 extension/content.js。
+  - 模拟播放器：<video> 由 canvas 推流；字幕节点 class 含 subtitle，按 currentTime 切换
+  - 用一个小 shim 代替 chrome.runtime / chrome.storage，直连本地代理（http://localhost:8787）
+  - 截图用 canvas 当前帧代替 captureVisibleTab
+  - 「字幕烧进画面」：字幕画进视频帧、DOM 里不再有，用来测本地画面识字
+  打开方式：在项目根目录起一个静态服务器（例如 python -m http.server 8790），访问 /dev/test-page.html
+-->
+<style>
+  :root { --bg: #f4f5f7; --card: #fff; --ink: #18191c; --ink-2: #61666d; --line: #e3e5e7; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.6 system-ui, "Microsoft YaHei", sans-serif; }
+  header { height: 56px; display: flex; align-items: center; padding: 0 24px; background: var(--card); border-bottom: 1px solid var(--line); font-weight: 700; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 24px; max-width: 1280px; margin: 20px auto; padding: 0 24px; }
+  h1.video-title { font-size: 20px; margin: 0 0 12px; }
+  .bpx-player-container { position: relative; background: #000; border-radius: 8px; overflow: hidden; }
+  .bpx-player-video-wrap video { display: block; width: 100%; aspect-ratio: 16 / 9; background: #000; }
+  .bpx-player-subtitle-wrap { position: absolute; left: 0; right: 0; bottom: 56px; text-align: center; pointer-events: none; }
+  .bpx-player-subtitle-panel-text { display: inline-block; padding: 2px 10px; background: rgba(0,0,0,.55); color: #fff; font-size: 20px; border-radius: 4px; }
+  .bpx-player-subtitle-panel-text:empty { display: none; }
+  .bpx-player-control-wrap { position: absolute; left: 0; right: 0; bottom: 0; height: 44px; display: flex; align-items: center; gap: 12px; padding: 0 12px; background: linear-gradient(transparent, rgba(0,0,0,.7)); color: #fff; }
+  .bpx-player-control-wrap button { background: rgba(255,255,255,.15); color: #fff; border: 0; border-radius: 6px; padding: 4px 12px; cursor: pointer; }
+  .bpx-player-ctrl-subtitle-menu { font-size: 12px; opacity: .8; }
+  aside .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 12px; color: var(--ink-2); }
+  .help { margin-top: 12px; color: var(--ink-2); font-size: 13px; }
+  .help code { background: var(--card); border: 1px solid var(--line); padding: 0 4px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>开发自测页 · 模拟课程播放页</header>
+<main>
+  <section>
+    <h1 class="video-title" title="线性代数 第3讲 向量组的线性相关性">线性代数 第3讲 向量组的线性相关性</h1>
+    <div class="bpx-player-container">
+      <div class="bpx-player-video-wrap"><video id="v" muted playsinline></video></div>
+      <div class="bpx-player-subtitle-wrap"><span class="bpx-player-subtitle-panel-text" id="sub"></span></div>
+      <div class="bpx-player-control-wrap">
+        <button id="toggle" type="button">播放</button>
+        <span id="clock">00:00</span>
+        <span class="bpx-player-ctrl-subtitle-menu">字幕 · 中文（自动生成）</span>
+      </div>
+    </div>
+    <p class="help">点「播放」，看几秒后暂停 → 画面中央出现「我这里不懂」，或随时按 <code>1</code>。
+      勾选 <label><input type="checkbox" id="nosub"> 关闭字幕</label> 可以测试降级路径；
+      勾选 <label><input type="checkbox" id="burn"> 字幕烧进画面</label> 可以测试画面识字（硬字幕）。
+      地址加 <code>?proxy=http://localhost:8788</code> 可以连别的代理。</p>
+  </section>
+  <aside>
+    <div class="card">推荐视频 1</div>
+    <div class="card">推荐视频 2</div>
+    <div class="card">推荐视频 3</div>
+  </aside>
+</main>
+
+<script>
+// ---------------------------------------------------------------- 模拟一节课
+const LECTURE = [
+  [0, '好，我们开始今天的内容'],
+  [3, '上节课我们讲了向量的线性组合'],
+  [7, '今天来看一个非常核心的概念'],
+  [11, '叫做向量组的线性相关性'],
+  [15, '我们来看这三个向量 a1 a2 a3'],
+  [19, '如果其中任何一个都不能由其余的线性表示'],
+  [24, '我们就说这个向量组线性无关'],
+  [28, '反过来，只要有一个能被别的表示出来'],
+  [32, '这个向量组就是线性相关的'],
+  [36, '注意这两个概念是互斥的'],
+  [40, '等价的说法是：只有零系数才能组合出零向量'],
+  [46, '我们看一个具体的例子'],
+  [50, '一零和零一这两个向量'],
+  [54, '显然谁也不是谁的倍数，所以线性无关'],
+  [60, ''],
+];
+const video = document.getElementById('v');
+const sub = document.getElementById('sub');
+const canvas = document.createElement('canvas');
+canvas.width = 960; canvas.height = 540;
+const g = canvas.getContext('2d');
+const burn = document.getElementById('burn');
+const params = new URLSearchParams(location.search);
+if (params.get('burn') === '1') burn.checked = true;
+const lineAt = (t) => { let line = ''; for (const [at, text] of LECTURE) if (t >= at) line = text; return line; };
+const fmt = (s) => String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+function draw() {
+  const t = video.currentTime || 0;
+  g.fillStyle = '#1d2b28'; g.fillRect(0, 0, 960, 540);
+  g.fillStyle = '#e8f1ee'; g.font = 'bold 40px "Microsoft YaHei", sans-serif';
+  g.fillText('§3 向量组的线性相关性', 60, 100);
+  g.font = '30px "Microsoft YaHei", sans-serif';
+  g.fillText('定义：k1·a1 + k2·a2 + k3·a3 = 0', 60, 200);
+  g.fillText('仅当 k1 = k2 = k3 = 0 时成立 ⇒ 线性无关', 60, 260);
+  g.fillStyle = '#7fd1bf'; g.fillText('例：(1,0) 与 (0,1)', 60, 340);
+  g.fillStyle = '#9fb3ad'; g.font = '22px monospace'; g.fillText('t = ' + fmt(t), 820, 510);
+  if (burn.checked) {
+    const line = lineAt(t);
+    if (line) {
+      g.font = 'bold 30px "Microsoft YaHei", sans-serif';
+      const w = g.measureText(line).width;
+      g.fillStyle = 'rgba(0,0,0,.6)'; g.fillRect(480 - w / 2 - 14, 452, w + 28, 46);
+      g.fillStyle = '#ffffff'; g.textAlign = 'center'; g.fillText(line, 480, 486); g.textAlign = 'start';
+    }
+  }
+  requestAnimationFrame(draw);
+}
+draw();
+video.srcObject = canvas.captureStream(30);
+
+function updateSub() {
+  const t = video.currentTime || 0;
+  document.getElementById('clock').textContent = fmt(t);
+  if (document.getElementById('nosub').checked || burn.checked) { sub.textContent = ''; return; }
+  const line = lineAt(t);
+  if (sub.textContent !== line) sub.textContent = line;
+}
+setInterval(updateSub, 200);
+const toggle = document.getElementById('toggle');
+toggle.addEventListener('click', () => (video.paused ? video.play() : video.pause()));
+video.addEventListener('play', () => (toggle.textContent = '暂停'));
+video.addEventListener('pause', () => (toggle.textContent = '播放'));
+
+// ---------------------------------------------------------------- chrome.* shim
+(() => {
+  const PROXY = (new URLSearchParams(location.search).get('proxy') || 'http://localhost:8787').replace(/\/+$/, '');
+  const store = { proxyUrl: PROXY, sendImage: true, hardsub: true, voice: true, mode: 'direct' };
+  const changeListeners = [];
+  const later = (fn) => setTimeout(fn, 0);
+  async function handle(msg) {
+    if (msg.type === 'capture') {
+      return { ok: true, dataUrl: canvas.toDataURL('image/jpeg', 0.7) };
+    }
+    if (msg.type === 'call') {
+      try {
+        const res = await fetch(PROXY + msg.path, msg.body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(msg.body) });
+        const data = await res.json().catch(() => null);
+        return res.ok ? { ok: true, data } : { ok: false, status: res.status, error: (data && data.error) || 'HTTP ' + res.status };
+      } catch (e) { return { ok: false, unreachable: true, error: String(e) }; }
+    }
+    return { ok: false, error: 'unknown' };
+  }
+  function makePort() {
+    const onMsg = [];
+    const ctrl = new AbortController();
+    const emit = (ev) => later(() => onMsg.forEach((f) => f(ev)));
+    return {
+      onMessage: { addListener: (f) => onMsg.push(f) },
+      onDisconnect: { addListener: () => {} },
+      disconnect: () => ctrl.abort(),
+      postMessage: async (msg) => {
+        let res;
+        try {
+          res = await fetch(PROXY + msg.path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(msg.body), signal: ctrl.signal });
+        } catch (e) { emit({ type: 'error', unreachable: true, message: String(e) }); emit({ type: 'end' }); return; }
+        if (!res.ok) { const d = await res.json().catch(() => ({})); emit({ type: 'error', message: d.error || 'HTTP ' + res.status }); emit({ type: 'end' }); return; }
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        try {
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            let i;
+            while ((i = buf.indexOf('\n\n')) >= 0) {
+              const line = buf.slice(0, i); buf = buf.slice(i + 2);
+              if (line.startsWith('data:')) emit(JSON.parse(line.slice(5)));
+            }
+          }
+        } catch (_) { /* aborted */ }
+        emit({ type: 'end' });
+      },
+    };
+  }
+  window.chrome = window.chrome || {};
+  const runtime = {
+    lastError: undefined,
+    sendMessage: (msg, cb) => { handle(msg).then((r) => cb && later(() => cb(r))); },
+    connect: () => makePort(),
+  };
+  const storage = {
+    local: {
+      get: (defaults, cb) => {
+        const keys = defaults && typeof defaults === 'object' ? defaults : {};
+        const out = {};
+        for (const [k, v] of Object.entries(keys)) out[k] = k in store ? store[k] : v;
+        later(() => cb(out));
+      },
+      set: (obj) => {
+        const changes = {};
+        for (const [k, v] of Object.entries(obj)) { changes[k] = { oldValue: store[k], newValue: v }; store[k] = v; }
+        later(() => changeListeners.forEach((f) => f(changes, 'local')));
+      },
+    },
+    onChanged: { addListener: (f) => changeListeners.push(f) },
+  };
+  try { Object.defineProperty(window.chrome, 'runtime', { value: runtime, configurable: true }); } catch (_) { window.chrome.runtime = runtime; }
+  try { Object.defineProperty(window.chrome, 'storage', { value: storage, configurable: true }); } catch (_) { window.chrome.storage = storage; }
+  window.__harnessStore = store;
+})();
+</script>
+<script src="../extension/content.js"></script>
+</body>
+</html>

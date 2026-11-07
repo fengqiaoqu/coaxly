@@ -1,0 +1,12 @@
+{
+  "_说明": "复制为 config.json 后填写 apiKey。任何 OpenAI 兼容接口都可以：改 baseUrl / model / visionModel 即可。保存即生效，不用重启代理（port 除外）。",
+  "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "apiKey": "",
+  "model": "qwen-plus",
+  "visionModel": "qwen-vl-plus",
+  "sendImage": true,
+  "ocr": true,
+  "port": 8787,
+  "httpProxy": "",
+  "timeoutSec": 60
+}

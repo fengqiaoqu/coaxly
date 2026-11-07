@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>学习搭子设置</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --ink: #18191c; --ink-2: #555b63; --ink-3: #8a9099;
+    --line: #e2e5e9; --accent: #0b7a68; --accent-soft: #e5f3f0; --ok: #0b7a68; --err: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141518; --card: #1c1d21; --ink: #eceef1; --ink-2: #b4b9c0; --ink-3: #868c94;
+      --line: #34373d; --accent: #3fb8a2; --accent-soft: #1f3a35; --ok: #3fb8a2; --err: #ff9a92;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.6 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  main { max-width: 560px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .lead { color: var(--ink-2); margin: 0 0 24px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
+  h2 { font-size: 14px; margin: 0 0 12px; }
+  label.field { display: block; margin-bottom: 14px; }
+  label.field span { display: block; font-weight: 600; margin-bottom: 6px; }
+  input[type="text"] {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--ink); font: inherit;
+  }
+  input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .check { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 12px; }
+  .check input { margin-top: 4px; accent-color: var(--accent); }
+  .check small, .hint { display: block; color: var(--ink-3); font-size: 12px; }
+  .seg { display: inline-flex; padding: 3px; border-radius: 9px; background: var(--bg); border: 1px solid var(--line); }
+  .seg label { padding: 4px 14px; border-radius: 7px; cursor: pointer; color: var(--ink-2); }
+  .seg input { display: none; }
+  .seg input:checked + span { color: var(--ink); font-weight: 600; }
+  .seg label:has(input:checked) { background: var(--card); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button {
+    padding: 7px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card);
+    color: var(--ink); font: inherit; cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #status { font-size: 13px; }
+  #status.ok { color: var(--ok); }
+  #status.err { color: var(--err); }
+  code { font: 12px ui-monospace, Consolas, monospace; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>学习搭子设置</h1>
+  <p class="lead">看 B 站课程时暂停，点「我这里不懂」或按 <code>1</code>，右侧抽屉里给出即时解释。</p>
+
+  <section>
+    <h2>本地代理</h2>
+    <label class="field">
+      <span>代理地址</span>
+      <input type="text" id="proxyUrl" placeholder="http://localhost:8787" spellcheck="false">
+      <small class="hint">双击项目里的 <code>启动.bat</code> 就会开启代理。API Key 只写在 <code>proxy/config.json</code>，扩展不保存 Key。</small>
+    </label>
+    <div class="row">
+      <button type="button" id="test">测试连接</button>
+      <span id="status" role="status"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>解释与追问</h2>
+    <label class="check">
+      <input type="checkbox" id="sendImage">
+      <span>附带暂停那一帧画面<small>只取视频画面（不含弹幕）。模型能看图就直接看；看不了图（如 DeepSeek）时，本地代理会先识别画面上的文字再交给模型。</small></span>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="hardsub">
+      <span>播放时读取画面里的硬字幕<small>有些视频的字幕是直接烧在画面里的，播放器读不到。开启后，没有 CC / AI 字幕时每 1.5 秒识别一次画面底部，图片只发给本机代理，不上传。</small></span>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="voice">
+      <span>启用语音追问<small>使用浏览器自带的语音识别；连不上时请直接打字。</small></span>
+    </label>
+    <div class="field">
+      <span style="display:block;font-weight:600;margin-bottom:6px">追问模式</span>
+      <div class="seg" role="radiogroup">
+        <label><input type="radio" name="mode" value="direct"><span>直说</span></label>
+        <label><input type="radio" name="mode" value="socratic"><span>带我想</span></label>
+      </div>
+      <small class="hint">抽屉底部也可以随时切换。「带我想」不直接给答案，一次只问你一个小问题。</small>
+    </div>
+  </section>
+
+  <section>
+    <h2>本地记录</h2>
+    <p class="hint" style="margin-top:0">每个视频最近几次求助会记在浏览器里，用来让解释换个角度、不复读。</p>
+    <button type="button" id="clearPast">清空求助记录</button>
+    <span id="clearStatus" class="hint" style="display:inline"></span>
+  </section>
+</main>
+<script src="options.js"></script>
+</body>
+</html>

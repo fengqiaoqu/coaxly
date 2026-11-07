@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "学习搭子 · B站视频即时解释",
+  "version": "0.1.0",
+  "description": "看 B 站课程时暂停，点「我这里不懂」或按 1，右侧抽屉里给出 120 字以内的即时解释，并可语音/文字追问。",
+  "permissions": ["storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://www.bilibili.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_title": "学习搭子设置"
+  }
+}
