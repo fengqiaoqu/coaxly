@@ -15,6 +15,7 @@
     POST /ocr       画面识字（本地 Windows OCR）
     POST /asr       语音识别（v1.2：默认 Windows 本机离线识别，可选云端 /audio/transcriptions）
     POST /summarize Call 4：历史节点的一句话说明（v1.2）
+    POST /keypoints Call 5：按段读字幕标注课程重点（v1.3；JSON 模式，失败走关键词规则兜底）
 #>
 param(
   [string]$ConfigPath = '',
@@ -44,7 +45,7 @@ if (-not (Test-Path $ConfigPath)) {
   if (Test-Path $example) { Copy-Item $example $ConfigPath }
 }
 
-$VERSION = '1.2.0'
+$VERSION = '1.3.0'
 
 # ---------------------------------------------------------------- 文案常量
 $T_UNKNOWN_SUBJECT  = '未知课程'
@@ -567,6 +568,7 @@ function Invoke-Health($ctx) {
       asrReady    = $(if ($cfg.asrEngine -ne 'off') { [bool](Initialize-Asr).ok } else { $false })
       asrError    = $(if ($cfg.asrEngine -ne 'off') { (Initialize-Asr).error } else { $null })
       asrModel    = $(if ($cfg.asrEngine -eq 'cloud') { [string](Get-Field $cfg.asr 'model' '') } else { $null })
+      features    = @('explain', 'route', 'followup', 'ocr', 'asr', 'summarize', 'keypoints')
       prompts     = $files
     })
   return 'ok'
@@ -1205,6 +1207,226 @@ function Invoke-SummarizeEndpoint($ctx, $body) {
   return "call4 $($rec.chars)字「$summary」"
 }
 
+# ---------------------------------------------------------------- /keypoints（Call 5：课程重点标注，v1.3）
+# 扩展按段送字幕来（完整字幕约 5 分钟一段，或播放时攒下的一段），这里找出值得回看的重点。
+# 模型输出会再校验一遍（时间落在本段并对齐字幕、长度、类别、去重、数量）；
+# 没配 Key / 上游出错 / 输出解析不了时按关键词规则粗略标注，source = rule。
+$KP_KINDS = @('定义', '结论', '方法', '强调', '易错')
+$KP_RULES = @(
+  @{ kind = '易错'; re = '容易(犯|错|混|搞混|弄错|忽略)|误区|混淆|千万别|千万不要|别搞错|常见错误|易错' },
+  @{ kind = '强调'; re = '重点|关键|核心|记住|考试|常考|必考|注意' },
+  @{ kind = '定义'; re = '叫做|称为|称作|定义' },
+  @{ kind = '结论'; re = '定理|结论|公式|总结|也就是说|本质上' }
+)
+
+function Format-Clock([double]$sec) {
+  $s = [int][math]::Floor([math]::Max(0, $sec))
+  return ('{0:00}:{1:00}' -f [math]::Floor($s / 60), ($s % 60))
+}
+
+function ConvertFrom-Clock($v) {
+  if ($null -eq $v) { return $null }
+  if ($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) { return [double]$v }
+  $s = ([string]$v).Trim().Trim('[', ']')
+  $m = [regex]::Match($s, '^(\d{1,3}):(\d{1,2})(?::(\d{1,2}))?$')
+  if ($m.Success) {
+    if ($m.Groups[3].Success) { return [double]([int]$m.Groups[1].Value * 3600 + [int]$m.Groups[2].Value * 60 + [int]$m.Groups[3].Value) }
+    return [double]([int]$m.Groups[1].Value * 60 + [int]$m.Groups[2].Value)
+  }
+  $d = 0.0
+  if ([double]::TryParse($s, [ref]$d)) { return $d }
+  return $null
+}
+
+function ConvertFrom-KeypointsJson([string]$text) {
+  $t = [regex]::Replace([string]$text, '<think>[\s\S]*?</think>', '')
+  $t = [regex]::Replace($t, '```(?:json)?', '', 'IgnoreCase')
+  $m = [regex]::Match($t, '\{[\s\S]*\}')
+  if ($m.Success) {
+    try { $o = $m.Value | ConvertFrom-Json } catch { $o = $null }
+    if ($o -and $o.PSObject.Properties['points']) { return @{ points = @($o.points | Where-Object { $_ }) } }
+  }
+  $m = [regex]::Match($t, '\[[\s\S]*\]')
+  if ($m.Success) {
+    try { $a = $m.Value | ConvertFrom-Json; return @{ points = @($a | Where-Object { $_ }) } } catch {}
+  }
+  return $null
+}
+
+# 把候选重点整理成最终结果：时间落在本段内（对齐到最近一句字幕的开头）、截断长度、类别归一、去重、限量
+function Resolve-Keypoints($cands, $lines, [double]$from, [double]$to, $known, [int]$max) {
+  $knownSet = @{}
+  foreach ($k in @($known)) { $n = Get-NormText ([string]$k); if ($n) { $knownSet[$n] = $true } }
+  $out = New-Object System.Collections.ArrayList
+  foreach ($c in @($cands)) {
+    $t = ConvertFrom-Clock (Get-Field $c 't' $null)
+    if ($null -eq $t -or $t -lt $from - 5 -or $t -gt $to + 5) { continue }
+    $best = $null
+    foreach ($l in $lines) { if ($null -eq $best -or [math]::Abs($l.t - $t) -lt [math]::Abs($best.t - $t)) { $best = $l } }
+    if ($best -and [math]::Abs($best.t - $t) -le 20) { $t = $best.t }
+    $t = [math]::Min([math]::Max($t, $from), $to)
+    $title = (([string](Get-Field $c 'title' '')) -replace '[\r\n]+', ' ').Trim().Trim('"', '“', '”', '「', '」')
+    if (-not $title) { continue }
+    if ($knownSet.ContainsKey((Get-NormText $title))) { continue }
+    $kind = [string](Get-Field $c 'kind' '')
+    if ($KP_KINDS -notcontains $kind) { $kind = '强调' }
+    $level = 1
+    try { if ([int](Get-Field $c 'level' 1) -eq 2) { $level = 2 } } catch {}
+    [void]$out.Add([ordered]@{
+        t         = [math]::Round($t, 1)
+        timestamp = Format-Clock $t
+        title     = Limit-Text $title 16
+        note      = Limit-Text ((([string](Get-Field $c 'note' '')) -replace '[\r\n]+', ' ').Trim()) 40
+        kind      = $kind
+        level     = $level
+      })
+  }
+  # 15 秒内的两个合并（留 level 高的）
+  $merged = New-Object System.Collections.ArrayList
+  foreach ($p in @($out | Sort-Object { $_.t })) {
+    $prev = if ($merged.Count) { $merged[$merged.Count - 1] } else { $null }
+    if ($prev -and $p.t - $prev.t -lt 15) {
+      if ($p.level -gt $prev.level) { $merged[$merged.Count - 1] = $p }
+      continue
+    }
+    [void]$merged.Add($p)
+  }
+  # level 2（核心）每 5 分钟最多 1 个：多出来的降成 1，留时间最早的
+  $l2Cap = [math]::Max(1, [math]::Ceiling($max / 3))
+  $l2 = 0
+  foreach ($p in $merged) { if ($p.level -eq 2) { $l2++; if ($l2 -gt $l2Cap) { $p.level = 1 } } }
+  $res = @($merged)
+  if ($res.Count -gt $max) {
+    $res = @($res | Sort-Object @{ Expression = { $_.level }; Descending = $true }, @{ Expression = { $_.t }; Descending = $false } | Select-Object -First $max)
+    $res = @($res | Sort-Object { $_.t })
+  }
+  return $res
+}
+
+# 规则兜底：含「重点 / 容易错 / 叫做 / 定理」等词的句子，每 5 分钟最多 2 个
+function Get-RuleKeypoints($lines, [double]$from, [double]$to, $known, [int]$max) {
+  $cands = New-Object System.Collections.ArrayList
+  $perSeg = @{}
+  $lastT = $null
+  foreach ($l in $lines) {
+    $hit = $null
+    foreach ($r in $KP_RULES) { if ($l.text -match $r.re) { $hit = $r; break } }
+    if (-not $hit) { continue }
+    if ($null -ne $lastT -and $l.t - $lastT -lt 15) { continue }  # 紧挨着的几句（「这是重点」「大家记住」）算同一个
+    $seg = [string][math]::Floor(($l.t - $from) / 300)
+    if (($perSeg[$seg] -as [int]) -ge 2) { continue }
+    $lastT = $l.t
+    $title = [regex]::Replace($l.text, '^(那么|所以|好|好的|这个|我们|大家|同学们|然后|接下来|嗯|啊)[，,、\s]*', '')
+    $title = ($title -split '[，,。；;！!？?]')[0].Trim()
+    if ($title.Length -lt 4) { $title = $l.text.Trim() }
+    $perSeg[$seg] = ($perSeg[$seg] -as [int]) + 1
+    [void]$cands.Add([pscustomobject]@{ t = $l.t; title = (Limit-Text $title 14); note = $l.text; kind = $hit.kind; level = 1 })
+  }
+  return @(Resolve-Keypoints $cands $lines $from $to $known $max)
+}
+
+function Invoke-KeypointsEndpoint($ctx, $body) {
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $cfg = Get-Config
+  $lines = @(@(Get-Field $body 'lines' @()) | ForEach-Object {
+      $t = ConvertFrom-Clock (Get-Field $_ 't' $null)
+      $text = ((([string](Get-Field $_ 'text' '')) -replace '\s+', ' ')).Trim()
+      if ($null -ne $t -and $text) { @{ t = [double]$t; text = $text } }
+    } | Sort-Object { $_.t })
+  $from = ConvertFrom-Clock (Get-Field $body 'span_from' $null)
+  $to = ConvertFrom-Clock (Get-Field $body 'span_to' $null)
+  if ($null -eq $from) { $from = $(if ($lines.Count) { $lines[0].t } else { 0 }) }
+  if ($null -eq $to) { $to = $(if ($lines.Count) { $lines[$lines.Count - 1].t } else { 0 }) }
+  if ($to -lt $from) { $to = $from }
+  $duration = ConvertFrom-Clock (Get-Field $body 'duration' $null)
+  $known = @(@(Get-Field $body 'known' @()) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Last 30)
+  $max = [int][math]::Max(1, [math]::Min(6, [math]::Ceiling(($to - $from) / 100)))
+
+  # 字幕拼成「[mm:ss] 句子」，最多 6000 字
+  $sb = New-Object System.Text.StringBuilder
+  $chars = 0
+  foreach ($l in $lines) {
+    if ($sb.Length -ge 6000) { break }
+    [void]$sb.Append('[' + (Format-Clock $l.t) + '] ' + $l.text + "`n")
+    $chars += ($l.text -replace '\s', '').Length
+  }
+  $transcript = $sb.ToString().TrimEnd()
+
+  $rec = [ordered]@{
+    type        = 'call5'
+    video_id    = Get-Field $body 'video_id' $null
+    source      = Get-Field $body 'source' $null
+    span_from   = [math]::Round($from, 1)
+    span_to     = [math]::Round($to, 1)
+    lines       = $lines.Count
+    chars       = $chars
+    known       = $known.Count
+    max_points  = $max
+  }
+  $points = @()
+  $resultSource = 'ai'
+  $reason = $null
+  $jsonMode = $null
+  if ($chars -lt 30) {
+    $resultSource = 'empty'
+  } elseif (-not (Test-HasKey $cfg)) {
+    $resultSource = 'rule'
+    $reason = 'no_api_key'
+  } else {
+    $vars = @{
+      subject    = Get-NonEmpty $body 'subject' $T_UNKNOWN_SUBJECT
+      span       = (Format-Clock $from) + '–' + (Format-Clock $to)
+      duration   = $(if ($duration -gt 0) { Format-Clock $duration } else { '未知' })
+      known      = $(if ($known.Count) { $known -join '、' } else { '（无）' })
+      max_points = [string]$max
+      transcript = $transcript
+    }
+    $system = Fill-Template (Read-Prompt 'call5_keypoints.md') $vars
+    $user = '请标出这一段字幕里的课程重点，只输出 JSON。'
+    $jsonMode = $true
+    $r = Invoke-Chat $cfg ([string]$cfg.model) $system $user 0.2 600 @{ response_format = @{ type = 'json_object' } }
+    if (-not $r.ok -and $r.status -ge 400 -and @(401, 403, 429) -notcontains $r.status) {
+      $jsonMode = $false
+      $r = Invoke-Chat $cfg ([string]$cfg.model) $system $user 0.2 600 $null
+    }
+    if (-not $r.ok) {
+      $resultSource = 'rule'
+      $reason = 'upstream_error'
+      $rec.error = $r.error
+    } else {
+      $parsed = ConvertFrom-KeypointsJson $r.text
+      if ($null -eq $parsed) {
+        $resultSource = 'rule'
+        $reason = 'parse_failed'
+        $rec.error = 'parse_failed: ' + (Limit-Text $r.text 160)
+      } else {
+        $rec.raw_points = @($parsed.points).Count
+        $points = @(Resolve-Keypoints $parsed.points $lines $from $to $known $max)
+      }
+    }
+  }
+  if ($resultSource -eq 'rule') { $points = @(Get-RuleKeypoints $lines $from $to $known $max) }
+
+  $rec.result = $resultSource
+  $rec.fallback_reason = $reason
+  $rec.json_mode = $jsonMode
+  $rec.points = @($points | ForEach-Object { "$($_.timestamp) [$($_.kind)$(if ($_.level -eq 2) { '·核心' })] $($_.title)" })
+  $rec.total_ms = $sw.ElapsedMilliseconds
+  Write-CallLog $rec
+  Send-Json $ctx 200 ([ordered]@{
+      ok              = $true
+      points          = $points
+      source          = $resultSource
+      fallback_reason = $reason
+      max_points      = $max
+      model           = $(if ($resultSource -eq 'ai') { [string]$cfg.model } else { $null })
+      total_ms        = $sw.ElapsedMilliseconds
+    })
+  $span = (Format-Clock $from) + '-' + (Format-Clock $to)
+  if ($resultSource -eq 'empty') { return "call5 $span 字幕太少，跳过" }
+  return "call5 $span $resultSource$(if ($reason) { "($reason)" }) → $($points.Count) 个重点"
+}
+
 # ---------------------------------------------------------------- /log（客户端事件）
 function Invoke-ClientLog($ctx, $body) {
   $rec = [ordered]@{ type = 'client_event' }
@@ -1234,6 +1456,7 @@ function Invoke-Request($ctx) {
     'POST /ocr'     { return (Invoke-OcrEndpoint $ctx (Read-Body $ctx)) }
     'POST /asr'     { return (Invoke-AsrEndpoint $ctx (Read-Body $ctx)) }
     'POST /summarize' { return (Invoke-SummarizeEndpoint $ctx (Read-Body $ctx)) }
+    'POST /keypoints' { return (Invoke-KeypointsEndpoint $ctx (Read-Body $ctx)) }
     default {
       Send-Json $ctx 404 @{ error = "没有这个接口：$method $path" }
       return 'not found'

@@ -9,6 +9,7 @@
 //   问题里含 "超长"       → Call 2 在 temperature 0.4 时返回超过 120 字（测降温重试）
 //   追问里含 "天气"/"游戏" → 路由判为 off_topic；含 "先修"/"高中" → related_general
 //   Call 4（system 里含「一句话说明」）→ 按追问里有没有「懂了」返回一句话说明（v1.2）
+//   Call 5（system 里含「标注课程重点」）→ 按关键词从字幕里挑重点，返回 JSON（v1.3）；字幕里含「乱码测试」→ 返回非 JSON（测规则兜底）
 //   POST /v1/audio/transcriptions → 云端语音识别（v1.2，asr.engine = "cloud" 时用）；model 含 "fail" 返回 500
 'use strict';
 const http = require('http');
@@ -43,6 +44,22 @@ function followup(q, system) {
   if (/懂了/.test(q)) return '好，那就继续往下看吧！';
   if (/展开/.test(q)) return '展开说：一组向量线性无关，是指只有全部系数取 0 时，它们的线性组合才等于零向量。换句话说，没有哪个向量是“多余的”。比如 (1,0) 和 (0,1)：想让 a(1,0)+b(0,1)=0，只能 a=b=0，所以无关；而 (1,0)、(2,0) 就相关，因为第二个是第一个的两倍。';
   return '不算。第三个能由前两个拼出来，就是“多余的”，这组向量就线性相关了。比如东、北、东北，东北=东+北。';
+}
+
+function keypoints(system) {
+  const max = Number((system.match(/最多 (\d+) 个重点/) || [])[1]) || 3;
+  if (/乱码测试/.test(system)) return '这一段讲得很好，重点很多。';
+  const lines = [...system.matchAll(/^\[(\d{1,3}:\d{2})\] (.+)$/gm)].map((m) => ({ t: m[1], text: m[2] }));
+  const rules = [[/容易|混淆|误区|千万别/, '易错'], [/重点|记住|考试|注意/, '强调'], [/叫做|称为|定义/, '定义'], [/定理|结论|公式|总结|也就是说/, '结论'], [/步骤|方法|第一步/, '方法']];
+  const points = [];
+  for (const l of lines) {
+    const r = rules.find(([re]) => re.test(l.text));
+    if (!r) continue;
+    const title = l.text.replace(/^(那么|所以|好|大家|同学们|这里)[，,]?/, '').split(/[，,。！？]/)[0].slice(0, 14);
+    points.push({ t: l.t, title, note: l.text.slice(0, 36), kind: r[1], level: /重点|记住|考试/.test(l.text) ? 2 : 1 });
+    if (points.length >= max) break;
+  }
+  return JSON.stringify({ points });
 }
 
 function send(res, status, obj) {
@@ -82,7 +99,7 @@ http.createServer(async (req, res) => {
   const user = textOf(userContent);
   const image = hasImage(userContent);
   const unresolved = (system.match(/\{\{\w+\}\}/g) || []);
-  const kind = /query router/.test(system) ? 'call1' : /一句话说明/.test(system) ? 'call4' : body.stream ? 'call3' : 'call2';
+  const kind = /标注课程重点/.test(system) ? 'call5' : /query router/.test(system) ? 'call1' : /一句话说明/.test(system) ? 'call4' : body.stream ? 'call3' : 'call2';
   console.log(`[mock] ${kind} model=${body.model} t=${body.temperature} stream=${!!body.stream} json=${!!body.response_format} image=${image} auth=${(req.headers.authorization || '').slice(0, 12)}… unresolved=${unresolved.join(',') || 'none'} user=${user.slice(0, 30)}`);
 
   if (body.response_format && /nojson/.test(body.model)) return send(res, 400, { error: { message: 'response_format is not supported' } });
@@ -92,10 +109,11 @@ http.createServer(async (req, res) => {
   if (kind === 'call1') content = /badjson/.test(body.model) ? '我觉得这是视频内的问题' : '```json\n' + JSON.stringify(route(user)) + '\n```';
   else if (kind === 'call2') content = explain(user, body.temperature, system);
   else if (kind === 'call4') content = '“' + summary(system) + '”';
+  else if (kind === 'call5') content = keypoints(system);
   else content = followup(user, system);
 
   if (!body.stream) {
-    await sleep(kind === 'call1' || kind === 'call4' ? 120 : 600);
+    await sleep(kind === 'call1' || kind === 'call4' ? 120 : kind === 'call5' ? 400 : 600);
     return send(res, 200, { id: 'mock', object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }] });
   }
 

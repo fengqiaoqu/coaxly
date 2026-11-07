@@ -3,6 +3,7 @@
 const DEFAULTS = {
   proxyUrl: 'http://localhost:8787', sendImage: true, hardsub: true, voice: true, mode: 'direct',
   voiceEngine: 'local', subGuide: true, summaryAi: true, // v1.2
+  keyPoints: true, kpTrack: true, kpCue: true, // v1.3
 };
 const $ = (id) => document.getElementById(id);
 const NODES_PER_VIDEO = 5; // 每个视频先显示最近几个节点，其余点「展开」
@@ -17,6 +18,8 @@ async function load() {
   $('voice').checked = s.voice !== false;
   $('subGuide').checked = s.subGuide !== false;
   $('summaryAi').checked = s.summaryAi !== false;
+  for (const id of ['keyPoints', 'kpTrack', 'kpCue']) $(id).checked = s[id] !== false;
+  syncKpDeps();
   for (const r of document.querySelectorAll('input[name="mode"]')) r.checked = r.value === s.mode;
   for (const r of document.querySelectorAll('input[name="voiceEngine"]')) r.checked = r.value === (s.voiceEngine === 'browser' ? 'browser' : 'local');
 }
@@ -28,8 +31,13 @@ $('proxyUrl').addEventListener('change', (e) => {
   e.target.value = v;
   save({ proxyUrl: v });
 });
-for (const id of ['sendImage', 'hardsub', 'voice', 'subGuide', 'summaryAi']) {
-  $(id).addEventListener('change', (e) => save({ [id]: e.target.checked }));
+for (const id of ['sendImage', 'hardsub', 'voice', 'subGuide', 'summaryAi', 'keyPoints', 'kpTrack', 'kpCue']) {
+  $(id).addEventListener('change', (e) => { save({ [id]: e.target.checked }); syncKpDeps(); });
+}
+// 总开关关掉时，两个子开关变灰（值保留）
+function syncKpDeps() {
+  const on = $('keyPoints').checked;
+  for (const id of ['kpTrack', 'kpCue']) { $(id).disabled = !on; $(id).closest('label').style.opacity = on ? '' : '.5'; }
 }
 for (const name of ['mode', 'voiceEngine']) {
   for (const r of document.querySelectorAll(`input[name="${name}"]`)) {
@@ -45,12 +53,14 @@ $('test').addEventListener('click', async () => {
   const res = await chrome.runtime.sendMessage({ type: 'call', path: '/health', method: 'GET' });
   if (res && res.ok) {
     const d = res.data || {};
-    status.className = d.hasKey ? 'ok' : 'err';
+    const old = d.version && !(d.features || []).includes('keypoints');
+    status.className = !d.hasKey ? 'err' : old ? 'warn' : 'ok';
     const look = d.sendImage === false
       ? (d.ocr === false ? '不看画面' : d.ocrReady ? '画面文字由本地识别' : '画面识字不可用：' + (d.ocrError || '请重启代理'))
       : `视觉模型 ${d.visionModel}`;
     let asr;
     if (!d.version) asr = '代理是旧版本（没有语音识别和一句话说明），请关掉「启动.bat」窗口再重新打开';
+    else if (!(d.features || []).includes('keypoints')) asr = `代理是 v${d.version}，没有课程重点功能，请关掉「启动.bat」窗口再重新打开`;
     else if (d.asrEngine === 'off') asr = '语音识别已在代理配置里关闭';
     else if (d.asrEngine === 'cloud') asr = `语音识别：云端 ${d.asrModel || ''}${d.asrReady ? '（本机识别兜底）' : ''}`;
     else asr = d.asrReady ? '语音识别：本机离线可用' : '本机语音识别不可用：' + (d.asrError || '未知原因');
@@ -150,6 +160,24 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && Object.keys(changes).some((k) => k.startsWith(LBHistory.PREFIX))) renderHistory();
 });
 
+// ------------------------------------------------------------------ 课程重点（v1.3）
+async function kpCount() {
+  const all = await chrome.storage.local.get(null);
+  const keys = Object.keys(all).filter((k) => k.startsWith('kp:'));
+  const points = keys.reduce((n, k) => n + ((all[k] && all[k].points) || []).length, 0);
+  return { keys, points };
+}
+async function renderKpStatus() {
+  const { keys, points } = await kpCount();
+  $('kpStatus').textContent = keys.length ? `已为 ${keys.length} 个视频标注了 ${points} 个重点` : '';
+}
+$('clearKp').addEventListener('click', async () => {
+  const { keys } = await kpCount();
+  if (keys.length && !confirm(`清空 ${keys.length} 个视频的重点标注？下次播放时会重新分析（会再调用模型）。`)) return;
+  if (keys.length) await chrome.storage.local.remove(keys);
+  $('kpStatus').textContent = `已清空 ${keys.length} 个视频的重点标注`;
+});
+
 // ------------------------------------------------------------------ 求助记录（给 Call 2 换角度用）
 $('clearPast').addEventListener('click', async () => {
   const all = await chrome.storage.local.get(null);
@@ -160,3 +188,4 @@ $('clearPast').addEventListener('click', async () => {
 
 load();
 renderHistory();
+renderKpStatus();
