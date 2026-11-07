@@ -9,8 +9,9 @@
 //   问题里含 "超长"       → Call 2 在 temperature 0.4 时返回超过 120 字（测降温重试）
 //   追问里含 "天气"/"游戏" → 路由判为 off_topic；含 "先修"/"高中" → related_general
 //   Call 4（system 里含「一句话说明」）→ 按追问里有没有「懂了」返回一句话说明（v1.2）
+//   Call 5（system 里含「标注课程重点」）→ 按关键词从字幕里挑重点，返回 JSON（v1.3）；字幕里含「乱码测试」→ 返回非 JSON（测规则兜底）
 //   POST /v1/audio/transcriptions → 云端语音识别（v1.2，asr.engine = "cloud" 时用）；model 含 "fail" 返回 500
-//   整片记忆（v1.3，system 里含「分层记忆·小节」/「分层记忆·全片」）→ 按字幕原文拼出小节摘要 / 章节大纲（JSON）
+//   整片记忆（v1.4，system 里含「分层记忆·小节」/「分层记忆·全片」）→ 按字幕原文拼出小节摘要 / 章节大纲（JSON）
 //   GET /__last?kind=call2  → 某一类调用最后一次的请求体（后台的整片记忆调用不会冲掉前台的 call2）
 'use strict';
 const http = require('http');
@@ -48,6 +49,22 @@ function followup(q, system) {
   return '不算。第三个能由前两个拼出来，就是“多余的”，这组向量就线性相关了。比如东、北、东北，东北=东+北。';
 }
 
+function keypoints(system) {
+  const max = Number((system.match(/最多 (\d+) 个重点/) || [])[1]) || 3;
+  if (/乱码测试/.test(system)) return '这一段讲得很好，重点很多。';
+  const lines = [...system.matchAll(/^\[(\d{1,3}:\d{2})\] (.+)$/gm)].map((m) => ({ t: m[1], text: m[2] }));
+  const rules = [[/容易|混淆|误区|千万别/, '易错'], [/重点|记住|考试|注意/, '强调'], [/叫做|称为|定义/, '定义'], [/定理|结论|公式|总结|也就是说/, '结论'], [/步骤|方法|第一步/, '方法']];
+  const points = [];
+  for (const l of lines) {
+    const r = rules.find(([re]) => re.test(l.text));
+    if (!r) continue;
+    const title = l.text.replace(/^(那么|所以|好|大家|同学们|这里)[，,]?/, '').split(/[，,。！？]/)[0].slice(0, 14);
+    points.push({ t: l.t, title, note: l.text.slice(0, 36), kind: r[1], level: /重点|记住|考试/.test(l.text) ? 2 : 1 });
+    if (points.length >= max) break;
+  }
+  return JSON.stringify({ points });
+}
+
 function send(res, status, obj) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
@@ -60,7 +77,7 @@ function summary(system) {
   return '“线性无关”就是每个向量都带来一个新方向';
 }
 
-// ---------------- 整片记忆（v1.3）：不懂内容，只按原文里出现的术语拼一个像样的摘要
+// ---------------- 整片记忆（v1.4）：不懂内容，只按原文里出现的术语拼一个像样的摘要
 const MEM_TERMS = ['极大线性无关组', '齐次线性方程组', '初等行变换', '线性无关', '线性相关', '线性组合', '张成', '零解', '共线', '共面', '秩'];
 const plain = (t) => t.replace(/\[\d{1,3}:\d{2}\]\s*/g, '').replace(/\s+/g, '');
 function memMap(user) {
@@ -123,7 +140,7 @@ http.createServer(async (req, res) => {
   const user = textOf(userContent);
   const image = hasImage(userContent);
   const unresolved = (system.match(/\{\{\w+\}\}/g) || []);
-  const kind = /query router/.test(system) ? 'call1' : /一句话说明/.test(system) ? 'call4'
+  const kind = /标注课程重点/.test(system) ? 'call5' : /query router/.test(system) ? 'call1' : /一句话说明/.test(system) ? 'call4'
     : /分层记忆·小节/.test(system) ? 'mem_map' : /分层记忆·全片/.test(system) ? 'mem_reduce' : body.stream ? 'call3' : 'call2';
   lastByKind[kind] = body;
   console.log(`[mock] ${kind} model=${body.model} t=${body.temperature} stream=${!!body.stream} json=${!!body.response_format} image=${image} auth=${(req.headers.authorization || '').slice(0, 12)}… unresolved=${unresolved.join(',') || 'none'} user=${user.slice(0, 30)}`);
@@ -135,12 +152,13 @@ http.createServer(async (req, res) => {
   if (kind === 'call1') content = /badjson/.test(body.model) ? '我觉得这是视频内的问题' : '```json\n' + JSON.stringify(route(user)) + '\n```';
   else if (kind === 'call2') content = explain(user, body.temperature, system);
   else if (kind === 'call4') content = '“' + summary(system) + '”';
+  else if (kind === 'call5') content = keypoints(system);
   else if (kind === 'mem_map') content = JSON.stringify(memMap(user));
   else if (kind === 'mem_reduce') content = JSON.stringify(memReduce(user));
   else content = followup(user, system);
 
   if (!body.stream) {
-    await sleep(kind === 'call1' || kind === 'call4' ? 120 : kind.startsWith('mem_') ? 900 : 600);
+    await sleep(kind === 'call1' || kind === 'call4' ? 120 : kind === 'call5' ? 400 : kind.startsWith('mem_') ? 900 : 600);
     return send(res, 200, { id: 'mock', object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }] });
   }
 

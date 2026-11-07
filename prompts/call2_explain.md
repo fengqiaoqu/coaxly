@@ -2,7 +2,7 @@
 Call 2 · 即时解释（规格第 4 节）
 有字幕时使用；字幕去空白后少于 10 个字符时，代理改用 call2_degraded.md。
 占位符：{{subject}} {{timestamp}} {{transcript}} {{question}} {{past}} {{route}}
-v1.3 分层记忆（探索）：{{global_layer}} {{section_layer}} {{recall_layer}} {{focus_before}} {{focus_after}}
+v1.4 整片记忆：{{global_layer}} {{section_layer}} {{recall_layer}} {{focus_before}} {{focus_after}}
   没有整片记忆时，这几层由代理填说明文字（例如“（无）”），{{transcript}} 仍是扩展抓到的 ±30 秒字幕。
   有整片记忆时，{{transcript}} 是从整片字幕里按暂停点截取的焦点层，带 ▶ 标记和“已听过 / 还没看到”分隔。
 超过 120 字时，代理会把 call2_retry_suffix.md 追加到末尾，再用 temperature 0.2 重试一次。

@@ -6,67 +6,79 @@
 <title>学习搭子设置</title>
 <style>
   :root {
-    --bg: #f6f7f9; --card: #ffffff; --ink: #18191c; --ink-2: #555b63; --ink-3: #8a9099;
-    --line: #e2e5e9; --accent: #0b7a68; --accent-soft: #e5f3f0; --ok: #0b7a68; --err: #b3261e;
+    --bg: #faf9f5; --bg-soft: #f0eee6; --surface: #ffffff;
+    --ink: #141413; --ink-2: #5e5d59; --ink-3: #87867f;
+    --line: #e6e3da; --line-strong: #d6d2c6;
+    --accent: #c96442; --accent-soft: #f5e7e0;
+    --ok: #4f6b3a; --err: #b53d33; --solid: #141413; --on-solid: #faf9f5;
+    --serif: Georgia, "Noto Serif SC", "Source Han Serif SC", "Source Han Serif CN", "Songti SC", STSong, SimSun, serif;
+    --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+    color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --bg: #141518; --card: #1c1d21; --ink: #eceef1; --ink-2: #b4b9c0; --ink-3: #868c94;
-      --line: #34373d; --accent: #3fb8a2; --accent-soft: #1f3a35; --ok: #3fb8a2; --err: #ff9a92;
+      --bg: #262624; --bg-soft: #30302e; --surface: #1f1e1d;
+      --ink: #faf9f5; --ink-2: #c2c0b6; --ink-3: #9c9a92;
+      --line: #3a3a36; --line-strong: #4a4944;
+      --accent: #d97757; --accent-soft: #3b2a23;
+      --ok: #a5b98a; --err: #f0938a; --solid: #faf9f5; --on-solid: #141413;
+      color-scheme: dark;
     }
   }
   * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--ink);
-    font: 14px/1.6 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-  }
-  main { max-width: 560px; margin: 40px auto; padding: 0 16px; }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  .lead { color: var(--ink-2); margin: 0 0 24px; }
-  section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
-  h2 { font-size: 14px; margin: 0 0 12px; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.65 var(--sans); }
+  main { max-width: 600px; margin: 56px auto 72px; padding: 0 16px; }
+  h1 { font: 500 30px/1.25 var(--serif); letter-spacing: -0.01em; margin: 0 0 8px; }
+  .lead { color: var(--ink-2); margin: 0 0 32px; font: 16px/1.7 var(--serif); }
+  section { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 22px 24px; margin-bottom: 16px; }
+  h2 { font: 500 19px/1.3 var(--serif); margin: 0 0 14px; }
   label.field { display: block; margin-bottom: 14px; }
   label.field span { display: block; font-weight: 600; margin-bottom: 6px; }
   input[type="text"] {
-    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
-    background: var(--bg); color: var(--ink); font: inherit;
+    width: 100%; padding: 9px 12px; border: 1px solid var(--line-strong); border-radius: 10px;
+    background: var(--bg); color: var(--ink); font: 13px var(--mono);
   }
-  input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .check { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 12px; }
-  .check input { margin-top: 4px; accent-color: var(--accent); }
-  .check small, .hint { display: block; color: var(--ink-3); font-size: 12px; }
-  .seg { display: inline-flex; padding: 3px; border-radius: 9px; background: var(--bg); border: 1px solid var(--line); }
-  .seg label { padding: 4px 14px; border-radius: 7px; cursor: pointer; color: var(--ink-2); }
+  input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+  .check { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 14px; cursor: pointer; }
+  .check input { margin-top: 4px; accent-color: var(--accent); width: 15px; height: 15px; flex: none; }
+  .check > span { font-weight: 500; }
+  .check small, .hint { display: block; color: var(--ink-3); font-size: 12.5px; font-weight: 400; line-height: 1.6; }
+  .seg { display: inline-flex; padding: 3px; border-radius: 999px; background: var(--bg-soft); border: 1px solid var(--line); }
+  .seg label { padding: 4px 16px; border-radius: 999px; cursor: pointer; color: var(--ink-2); }
   .seg input { display: none; }
   .seg input:checked + span { color: var(--ink); font-weight: 600; }
-  .seg label:has(input:checked) { background: var(--card); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+  .seg label:has(input:checked) { background: var(--surface); box-shadow: 0 1px 2px rgba(20,20,19,.12); }
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   button {
-    padding: 7px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card);
-    color: var(--ink); font: inherit; cursor: pointer;
+    padding: 7px 16px; border-radius: 999px; border: 1px solid var(--line-strong); background: transparent;
+    color: var(--ink); font: 500 13px var(--sans); cursor: pointer;
   }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:hover { background: var(--bg-soft); }
+  button.primary { background: var(--solid); border-color: var(--solid); color: var(--on-solid); }
+  button.primary:hover { opacity: .88; background: var(--solid); }
   #status { font-size: 13px; }
   #status.ok { color: var(--ok); }
   #status.err { color: var(--err); }
-  code { font: 12px ui-monospace, Consolas, monospace; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
-  .ver { margin-left: 6px; padding: 1px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 600; vertical-align: middle; }
-  .sub { margin: 4px 0 12px 26px; }
-  .sub .seg label { padding: 3px 12px; font-size: 13px; }
+  #status.warn { color: var(--accent); }
+  code { font: 12px var(--mono); background: var(--bg-soft); padding: 1px 6px; border-radius: 5px; }
+  .ver { margin-left: 10px; padding: 2px 9px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font: 600 12px var(--sans); vertical-align: middle; letter-spacing: 0; }
+  .sub { margin: 4px 0 14px 27px; }
+  .sub .seg label { padding: 3px 13px; font-size: 13px; }
   .hist-video { border-top: 1px solid var(--line); padding: 12px 0 4px; }
   .hist-video:first-child { border-top: 0; padding-top: 4px; }
-  .hist-video h3 { margin: 0 0 6px; font-size: 13px; display: flex; gap: 8px; align-items: baseline; }
+  .hist-video h3 { margin: 0 0 6px; font: 500 14px/1.5 var(--serif); display: flex; gap: 8px; align-items: baseline; }
   .hist-video h3 .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .hist-video h3 .n { flex: none; color: var(--ink-3); font-weight: 400; font-size: 12px; }
-  .hist-node { display: flex; gap: 10px; width: 100%; margin: 2px 0; padding: 7px 8px; border: 0; border-radius: 8px; background: transparent; text-align: left; }
-  .hist-node:hover { background: var(--accent-soft); }
+  .hist-video h3 .n { flex: none; color: var(--ink-3); font: 400 12px var(--sans); }
+  .hist-node { display: flex; gap: 10px; width: 100%; margin: 2px 0; padding: 7px 10px; border: 0; border-radius: 10px; background: transparent; text-align: left; font-weight: 400; }
+  .hist-node:hover { background: var(--bg-soft); }
   .hist-node:disabled { cursor: default; opacity: .6; }
   .hist-node:disabled:hover { background: transparent; }
-  .hist-node .ts { flex: none; font: 600 12px/1.7 ui-monospace, Consolas, monospace; color: var(--accent); }
+  .hist-node .ts { flex: none; font: 600 12px/1.75 var(--mono); color: var(--accent); }
   .hist-node .body { flex: 1; min-width: 0; }
   .hist-node .sum { display: block; font-size: 13px; line-height: 1.55; word-break: break-word; }
   .hist-node .meta { display: block; font-size: 11px; color: var(--ink-3); }
-  .more { margin: 4px 0 0 8px; padding: 2px 6px; border: 0; background: transparent; color: var(--accent); font-size: 12px; }
+  .more { margin: 4px 0 0 8px; padding: 2px 8px; border: 0; background: transparent; color: var(--accent); font-size: 12px; }
   #histList:empty::before { content: "还没有学习历史。"; color: var(--ink-3); font-size: 13px; }
 </style>
 </head>
@@ -83,7 +95,7 @@
       <small class="hint">双击项目里的 <code>启动.bat</code> 就会开启代理。API Key 只写在 <code>proxy/config.json</code>，扩展不保存 Key。</small>
     </label>
     <div class="row">
-      <button type="button" id="test">测试连接</button>
+      <button type="button" id="test" class="primary">测试连接</button>
       <span id="status" role="status"></span>
     </div>
   </section>
@@ -120,6 +132,27 @@
         <label><input type="radio" name="mode" value="socratic"><span>带我想</span></label>
       </div>
       <small class="hint">抽屉底部也可以随时切换。「带我想」不直接给答案，一次只问你一个小问题。</small>
+    </div>
+  </section>
+
+  <section>
+    <h2>课程重点</h2>
+    <p class="hint" style="margin-top:0">读字幕判定课程的重点（定义、结论、方法、老师强调的、易错的），在进度条上标出来；抽屉里点「重点」看列表，点一条就跳过去。结果存在这台电脑的浏览器里，同一个视频再打开不会重复分析。</p>
+    <label class="check">
+      <input type="checkbox" id="keyPoints">
+      <span>自动标注课程重点<small>播放满 10 秒后开始，按段交给本地代理分析（大约每 5 分钟字幕调用一次模型）。关掉后不再调用，进度条上也不显示标记。</small></span>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="kpTrack">
+      <span>读取完整字幕（课程重点和整片记忆都用）<small>用你在 B 站的登录状态读取这个视频的 CC / AI 字幕（和播放器自己取字幕走同一个接口）。有了完整字幕，能提前标出全片重点；求助时 AI 也读过整部视频（整片记忆），知道全片在讲什么、现在讲到哪一章。关掉或视频没有字幕时，只用已经播放过的字幕。</small></span>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="kpCue">
+      <span>播放经过重点时提示<small>在视频左上角显示 5 秒，不暂停视频；点提示可以看全部重点。</small></span>
+    </label>
+    <div class="row">
+      <button type="button" id="clearKp">清空重点标注</button>
+      <span id="kpStatus" class="hint" style="display:inline"></span>
     </div>
   </section>
 

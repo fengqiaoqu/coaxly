@@ -13,6 +13,11 @@
   - v1.2：仿 B 站的字幕菜单（.bpx-player-ctrl-subtitle），可切换「已打开 / 没打开 / 要登录 / 没有字幕 / 没有字幕按钮」
           视频时间是可跳转的虚拟时钟（MediaStream 本身不能 seek），用来测回溯和「倒回 30 秒」
           chrome.storage 的 hist:/past: 存进 localStorage，刷新页面历史还在
+  - v1.3：一节 3 分钟的课（有定义、方法、强调、易错、总结，用来测课程重点标注）
+          仿 B 站进度条：.bpx-player-progress（鼠标移到播放器上才显示，可点击跳转，悬停出现 .bpx-player-progress-popup）
+                        + 控制条收起时底部常驻的细进度条 .bpx-player-shadow-progress-area
+          仿 B 站字幕接口：拦截 api.bilibili.com 的 view / player 接口和字幕文件（需要地址里带 ?bvid=BV…）
+          chrome.storage 的 kp: 也存进 localStorage
   打开方式：在项目根目录起一个静态服务器（例如 python -m http.server 8790），访问 /dev/test-page.html
   地址参数：
     ?proxy=http://localhost:8788  连别的代理（开发代理见 .claude/launch.json 的 proxy-dev）
@@ -21,9 +26,13 @@
     ?rate=2        虚拟时钟倍速（测「播放 20 秒无字幕主动提醒」时省时间；不要超过 2）
     ?fakemic=1     假麦克风：把 dev/sample-question.wav 当作麦克风输入（测本机语音识别全流程）
     ?mic=deny      模拟麦克风权限被拒
-    ?fresh=1       清空本页保存的历史
-    ?full=1        v1.3 整片字幕：换成 dev/sample-subtitles.json 那节约 8 分钟的课，并把整份字幕放进页面
-                   （<script id="lb-dev-fullsubs">），content.js 当作从 B 站接口拿到的整片字幕 → /memory/build
+    ?fresh=1       清空本页保存的历史和重点
+    ?bvid=BV1test  模拟 B 站视频地址（v1.3：有 bvid 才会去取完整字幕；不带就是「番剧 / 其他页面」，只能用已播放字幕）
+    ?track=1|bad|short|login|none  模拟字幕接口（默认 none）：
+                   1 = 有完整字幕；bad = 返回别的视频的字幕（时长对得上，要靠播放时的字幕识破）；
+                   short = 字幕太短（取回时就判为对不上）；login = 要登录才有字幕；none = 没有字幕
+    ?full=1        v1.4 整片记忆：换成 dev/sample-subtitles.json 那节约 8 分钟的课，并自动带上 ?bvid=BV1full&track=1，
+                   字幕走上面的仿 B 站接口 → 课程重点 + /memory/build
 -->
 <style>
   :root { --bg: #f4f5f7; --card: #fff; --ink: #18191c; --ink-2: #61666d; --line: #e3e5e7; }
@@ -34,11 +43,29 @@
   h1.video-title { font-size: 20px; margin: 0 0 12px; }
   .bpx-player-container { position: relative; background: #000; border-radius: 8px; overflow: hidden; }
   .bpx-player-video-wrap video { display: block; width: 100%; aspect-ratio: 16 / 9; background: #000; }
-  .bpx-player-subtitle-wrap { position: absolute; left: 0; right: 0; bottom: 56px; text-align: center; pointer-events: none; }
+  .bpx-player-subtitle-wrap { position: absolute; left: 0; right: 0; bottom: 64px; text-align: center; pointer-events: none; }
   .bpx-player-subtitle-panel-text { display: inline-block; padding: 2px 10px; background: rgba(0,0,0,.55); color: #fff; font-size: 20px; border-radius: 4px; }
   .bpx-player-subtitle-panel-text:empty { display: none; }
-  .bpx-player-control-wrap { position: absolute; left: 0; right: 0; bottom: 0; height: 44px; display: flex; align-items: center; gap: 12px; padding: 0 12px; background: linear-gradient(transparent, rgba(0,0,0,.7)); color: #fff; }
+  .bpx-player-control-wrap { position: absolute; left: 0; right: 0; bottom: 0; padding: 0 12px; background: linear-gradient(transparent, rgba(0,0,0,.7)); color: #fff; transition: opacity .2s; }
+  .bpx-player-control-bottom { height: 44px; display: flex; align-items: center; gap: 12px; }
   .bpx-player-control-wrap button { background: rgba(255,255,255,.15); color: #fff; border: 0; border-radius: 6px; padding: 4px 12px; cursor: pointer; }
+  /* 仿 B 站进度条：wrap 是 16px 高的可点击区域，里面 4px 的 .bpx-player-progress 才是那根条 */
+  .bpx-player-progress-area { padding-top: 8px; }
+  .bpx-player-progress-wrap { position: relative; height: 16px; display: flex; align-items: center; cursor: pointer; }
+  .bpx-player-progress { position: relative; display: flex; width: 100%; height: 4px; background: rgba(255,255,255,.25); border-radius: 2px; }
+  .bpx-player-progress-schedule-current { position: absolute; left: 0; top: 0; height: 100%; background: #00aeec; border-radius: 2px; }
+  .bpx-player-progress-popup { position: absolute; bottom: 18px; transform: translateX(-50%); padding: 4px 8px; border-radius: 4px; background: rgba(0,0,0,.8); font-size: 12px; white-space: nowrap; display: none; pointer-events: none; }
+  .bpx-player-progress-popup .thumb { width: 160px; height: 90px; background: #2c3a37; border-radius: 3px; margin-bottom: 4px; }
+  .bpx-player-progress-wrap:hover .bpx-player-progress-popup { display: block; }
+  .bpx-player-shadow-progress-area { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: rgba(255,255,255,.2); opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .bpx-player-shadow-progress-area .cur { position: absolute; left: 0; top: 0; height: 100%; background: #00aeec; }
+  /* 播放中、鼠标不在播放器上 → 控制条收起，只剩底部细进度条（和 B 站一样） */
+  .bpx-player-container.playing:not(:hover) .bpx-player-control-wrap,
+  .bpx-player-container.ctrl-hidden .bpx-player-control-wrap { opacity: 0; pointer-events: none; }
+  .bpx-player-container.playing:not(:hover) .bpx-player-shadow-progress-area,
+  .bpx-player-container.ctrl-hidden .bpx-player-shadow-progress-area { opacity: 1; }
+  .bpx-player-container.ctrl-shown .bpx-player-control-wrap { opacity: 1 !important; pointer-events: auto !important; }
+  .bpx-player-container.ctrl-shown .bpx-player-shadow-progress-area { opacity: 0 !important; }
   .bpx-player-ctrl-subtitle { position: relative; margin-left: auto; }
   .bpx-player-ctrl-subtitle-menu { position: absolute; right: 0; bottom: 36px; min-width: 170px; padding: 6px; border-radius: 8px; background: rgba(20,20,20,.92); font-size: 12px; display: none; }
   .bpx-player-ctrl-subtitle.open .bpx-player-ctrl-subtitle-menu { display: block; }
@@ -58,20 +85,33 @@
 <main>
   <section>
     <h1 class="video-title" title="线性代数 第3讲 向量组的线性相关性">线性代数 第3讲 向量组的线性相关性</h1>
-    <div class="bpx-player-container">
+    <div class="bpx-player-container" id="player">
       <div class="bpx-player-video-wrap"><video id="v" muted playsinline></video></div>
       <div class="bpx-player-subtitle-wrap"><span class="bpx-player-subtitle-panel-text" id="sub"></span></div>
       <div class="bpx-player-control-wrap">
-        <button id="toggle" type="button">播放</button>
-        <span id="clock">00:00</span>
-        <div class="bpx-player-ctrl-btn bpx-player-ctrl-subtitle" id="subctrl">
-          <button type="button" id="subbtn">字幕</button>
-          <div class="bpx-player-ctrl-subtitle-menu">
-            <div class="bpx-player-ctrl-subtitle-language-unlogin" style="display:none">登录后才能看 AI 字幕</div>
-            <ul id="langs"></ul>
+        <div class="bpx-player-control-top">
+          <div class="bpx-player-progress-area">
+            <div class="bpx-player-progress-wrap" id="pwrap">
+              <div class="bpx-player-progress" id="pbar">
+                <div class="bpx-player-progress-schedule"><div class="bpx-player-progress-schedule-current" id="pcur"></div></div>
+              </div>
+              <div class="bpx-player-progress-popup" id="ppop"><div class="thumb"></div><span id="ptime">00:00</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="bpx-player-control-bottom">
+          <button id="toggle" type="button">播放</button>
+          <span id="clock">00:00</span>
+          <div class="bpx-player-ctrl-btn bpx-player-ctrl-subtitle" id="subctrl">
+            <button type="button" id="subbtn">字幕</button>
+            <div class="bpx-player-ctrl-subtitle-menu">
+              <div class="bpx-player-ctrl-subtitle-language-unlogin" style="display:none">登录后才能看 AI 字幕</div>
+              <ul id="langs"></ul>
+            </div>
           </div>
         </div>
       </div>
+      <div class="bpx-player-shadow-progress-area"><div class="cur" id="scur"></div></div>
     </div>
     <p class="help">点「播放」，看几秒后暂停 → 画面中央出现「我这里不懂」，或随时按 <code>1</code>。地址参数见源码顶部注释。</p>
     <div class="harness">
@@ -85,8 +125,16 @@
         </select>
       </label>
       <label><input type="checkbox" id="burn"> 字幕烧进画面</label>
+      <label>控制条
+        <select id="ctrlstate">
+          <option value="auto">跟鼠标</option>
+          <option value="shown">一直显示</option>
+          <option value="hidden">收起</option>
+        </select>
+      </label>
       <button type="button" id="seek0">跳到 00:00</button>
       <button type="button" id="clearHist">清空本页历史</button>
+      <button type="button" id="clearKp">清空本页重点</button>
     </div>
   </section>
   <aside>
@@ -97,7 +145,7 @@
 </main>
 
 <script>
-// ---------------------------------------------------------------- 模拟一节课
+// ---------------------------------------------------------------- 模拟一节课（3 分钟；?full=1 换成 8 分钟的样例课）
 let LECTURE = [
   [0, '好，我们开始今天的内容'],
   [3, '上节课我们讲了向量的线性组合'],
@@ -113,16 +161,48 @@ let LECTURE = [
   [46, '我们看一个具体的例子'],
   [50, '一零和零一这两个向量'],
   [54, '显然谁也不是谁的倍数，所以线性无关'],
-  [60, ''],
+  [60, '那么怎么判断一组向量是不是线性相关呢'],
+  [64, '方法是把它们拼成一个矩阵'],
+  [68, '第一步，把向量按列排成矩阵 A'],
+  [72, '第二步，对 A 做初等行变换化成阶梯形'],
+  [77, '第三步，数一数非零行有几行'],
+  [81, '这个数就是矩阵的秩'],
+  [85, '如果秩等于向量的个数，就线性无关'],
+  [90, '如果秩小于向量的个数，就线性相关'],
+  [95, '这个结论非常重要，考试几乎每年都考'],
+  [100, '大家一定要记住'],
+  [104, '我们再看一个例子'],
+  [108, '一二和二四这两个向量'],
+  [112, '第二个正好是第一个的两倍'],
+  [116, '所以它们线性相关'],
+  [120, '这里很多同学容易犯一个错误'],
+  [124, '以为向量个数多就一定线性相关'],
+  [128, '其实要看向量的维数'],
+  [132, '定理：当向量个数大于维数时，一定线性相关'],
+  [138, '比如三维空间里任意四个向量'],
+  [142, '一定是线性相关的'],
+  [146, '但是个数小于等于维数时，不一定'],
+  [150, '这一点千万别搞混'],
+  [155, '最后我们总结一下今天的内容'],
+  [159, '线性无关就是谁都不能由别人表示'],
+  [164, '判断方法是看矩阵的秩'],
+  [168, '个数大于维数必定相关'],
+  [172, '下节课我们讲极大线性无关组'],
+  [176, '好，今天就到这里'],
+  [180, ''],
 ];
+// track=bad 用：一节别的课（做菜），时长对得上，内容完全对不上
+const OTHER = ['今天我们来做一道番茄炒蛋', '先把鸡蛋打散加一点盐', '番茄切成小块备用', '锅里放油烧到七成热', '倒入蛋液快速翻炒', '炒到凝固就盛出来', '再放一点油炒番茄', '番茄出汁以后加糖', '把鸡蛋倒回去一起翻炒', '最后撒一把葱花', '出锅装盘', '这道菜的关键是火候', '鸡蛋不要炒老了', '番茄要选熟一点的', '喜欢酸一点可以少放糖', '下期我们做红烧肉'];
 const video = document.getElementById('v');
 const sub = document.getElementById('sub');
 const params = new URLSearchParams(location.search);
-let DURATION = 64;
+let DURATION = 184;
 
-// ---------------------------------------------------------------- v1.3 整片字幕（?full=1）
-// 同步读 sample-subtitles.json：必须在 content.js 之前放好 #lb-dev-fullsubs，它启动时就会去取整片字幕
-if (params.get('full') === '1') {
+// ---------------------------------------------------------------- v1.4 整片记忆（?full=1）
+// 同步读 sample-subtitles.json 换掉上面那节 3 分钟的课；补上 bvid / track=1，让 content.js 从下面的仿 B 站字幕接口读到整份字幕。
+// 要在 content.js 之前改好地址：它启动时就按地址算视频 ID。
+const FULL = params.get('full') === '1';
+if (FULL) {
   try {
     const xhr = new XMLHttpRequest();
     xhr.open('GET', 'sample-subtitles.json', false);
@@ -132,12 +212,10 @@ if (params.get('full') === '1') {
     const end = body.length ? body[body.length - 1].to : 60;
     LECTURE.push([end, '']);
     DURATION = Math.ceil(end) + 3;
-    const el = document.createElement('script');
-    el.type = 'application/json';
-    el.id = 'lb-dev-fullsubs';
-    el.textContent = JSON.stringify({ lan: 'ai-zh', desc: '开发自测：合成的线性代数课', duration: DURATION, body });
-    document.head.appendChild(el);
   } catch (e) { console.warn('[harness] 读 sample-subtitles.json 失败', e); }
+  if (!params.get('bvid')) params.set('bvid', 'BV1full');
+  if (!params.get('track')) params.set('track', '1');
+  history.replaceState(null, '', location.pathname + '?' + params.toString());
 }
 
 // ---------------------------------------------------------------- 可跳转的虚拟时钟（canvas 推流的 <video> 本身不能 seek）
@@ -157,6 +235,8 @@ Object.defineProperty(video, 'currentTime', {
 Object.defineProperty(video, 'duration', { configurable: true, get: () => DURATION });
 video.addEventListener('play', () => { if (clock.startedAt == null) clock.startedAt = performance.now(); });
 video.addEventListener('pause', () => { clock.base = vnow(); clock.startedAt = null; });
+// timeupdate：MediaStream 播放时浏览器不会按虚拟时钟发这个事件，自己发（扩展靠它检测「播放经过重点」）
+setInterval(() => { if (!video.paused) video.dispatchEvent(new Event('timeupdate')); }, 250);
 
 // ---------------------------------------------------------------- 仿 B 站字幕菜单
 const subctrl = document.getElementById('subctrl');
@@ -185,6 +265,27 @@ renderSubCtrl();
 subSel.addEventListener('change', () => { subState = subSel.value; renderSubCtrl(); });
 document.getElementById('subbtn').addEventListener('click', () => subctrl.classList.toggle('open'));
 document.getElementById('seek0').addEventListener('click', () => { video.currentTime = 0; });
+
+// ---------------------------------------------------------------- 仿 B 站进度条
+const player = document.getElementById('player');
+const pwrap = document.getElementById('pwrap');
+const pbar = document.getElementById('pbar');
+const ppop = document.getElementById('ppop');
+const ctrlSel = document.getElementById('ctrlstate');
+ctrlSel.addEventListener('change', () => {
+  player.classList.toggle('ctrl-shown', ctrlSel.value === 'shown');
+  player.classList.toggle('ctrl-hidden', ctrlSel.value === 'hidden');
+});
+const ratioAt = (x) => { const r = pbar.getBoundingClientRect(); return Math.max(0, Math.min(1, (x - r.left) / r.width)); };
+pwrap.addEventListener('click', (e) => { video.currentTime = ratioAt(e.clientX) * DURATION; });
+pwrap.addEventListener('mousemove', (e) => {
+  const r = pwrap.getBoundingClientRect();
+  ppop.style.left = (e.clientX - r.left) + 'px';
+  document.getElementById('ptime').textContent = fmt(ratioAt(e.clientX) * DURATION);
+});
+video.addEventListener('play', () => player.classList.add('playing'));
+video.addEventListener('pause', () => player.classList.remove('playing'));
+
 const canvas = document.createElement('canvas');
 canvas.width = 960; canvas.height = 540;
 const g = canvas.getContext('2d');
@@ -198,9 +299,19 @@ function draw() {
   g.fillStyle = '#e8f1ee'; g.font = 'bold 40px "Microsoft YaHei", sans-serif';
   g.fillText('§3 向量组的线性相关性', 60, 100);
   g.font = '30px "Microsoft YaHei", sans-serif';
-  g.fillText('定义：k1·a1 + k2·a2 + k3·a3 = 0', 60, 200);
-  g.fillText('仅当 k1 = k2 = k3 = 0 时成立 ⇒ 线性无关', 60, 260);
-  g.fillStyle = '#7fd1bf'; g.fillText('例：(1,0) 与 (0,1)', 60, 340);
+  if (t < 60) {
+    g.fillText('定义：k1·a1 + k2·a2 + k3·a3 = 0', 60, 200);
+    g.fillText('仅当 k1 = k2 = k3 = 0 时成立 ⇒ 线性无关', 60, 260);
+    g.fillStyle = '#7fd1bf'; g.fillText('例：(1,0) 与 (0,1)', 60, 340);
+  } else if (t < 120) {
+    g.fillText('判断：向量按列排成 A，化阶梯形', 60, 200);
+    g.fillText('r(A) = 个数 ⇒ 无关；r(A) < 个数 ⇒ 相关', 60, 260);
+    g.fillStyle = '#7fd1bf'; g.fillText('例：(1,2) 与 (2,4)', 60, 340);
+  } else {
+    g.fillText('定理：个数 > 维数 ⇒ 一定线性相关', 60, 200);
+    g.fillText('个数 ≤ 维数时不一定', 60, 260);
+    g.fillStyle = '#7fd1bf'; g.fillText('易错：个数多 ≠ 一定相关', 60, 340);
+  }
   g.fillStyle = '#9fb3ad'; g.font = '22px monospace'; g.fillText('t = ' + fmt(t), 820, 510);
   if (burn.checked) {
     const line = lineAt(t);
@@ -219,6 +330,10 @@ video.srcObject = canvas.captureStream(30);
 function updateSub() {
   const t = video.currentTime || 0;
   document.getElementById('clock').textContent = fmt(t);
+  const pct = (t / DURATION * 100).toFixed(2) + '%';
+  document.getElementById('pcur').style.width = pct;
+  document.getElementById('scur').style.width = pct;
+  if (t >= DURATION && !video.paused) video.pause();
   if (subState !== 'on' || burn.checked) { sub.textContent = ''; return; }
   const line = lineAt(t);
   if (sub.textContent !== line) sub.textContent = line;
@@ -229,11 +344,43 @@ toggle.addEventListener('click', () => (video.paused ? video.play() : video.paus
 video.addEventListener('play', () => (toggle.textContent = '暂停'));
 video.addEventListener('pause', () => (toggle.textContent = '播放'));
 
+// ---------------------------------------------------------------- 仿 B 站字幕接口（v1.3）
+(() => {
+  const mode = params.get('track') || 'none';
+  const realFetch = window.fetch.bind(window);
+  const SUB_URL = '//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/mock-lecture.json';
+  const json = (obj) => new Promise((r) => setTimeout(() => r(new Response(JSON.stringify(obj), { status: 200, headers: { 'Content-Type': 'application/json' } })), 120));
+  function trackBody() {
+    if (mode === 'bad') {
+      const step = (DURATION - 8) / OTHER.length;
+      return OTHER.map((text, i) => ({ from: i * step, to: i * step + step - 0.5, content: text }));
+    }
+    const lines = LECTURE.filter(([, text]) => text);
+    const body = lines.map(([at, text], i) => ({ from: at, to: (LECTURE[LECTURE.findIndex(([a]) => a === at) + 1] || [DURATION])[0] - 0.2, content: text }));
+    return mode === 'short' ? body.slice(0, 5) : body;
+  }
+  window.__trackCalls = [];
+  window.fetch = (input, init) => {
+    const url = String(typeof input === 'string' ? input : input.url);
+    if (!/api\.bilibili\.com|hdslb\.com/.test(url)) return realFetch(input, init);
+    window.__trackCalls.push(url);
+    if (/\/x\/web-interface\/view/.test(url)) {
+      return json({ code: 0, data: { bvid: params.get('bvid'), cid: 10001, duration: DURATION, desc: FULL ? '开发自测：合成的线性代数课（线性相关与线性无关）' : '', pages: [{ page: 1, cid: 10001, duration: DURATION, part: '第3讲' }] } });
+    }
+    if (/\/x\/player\/(wbi\/)?v2/.test(url)) {
+      const has = mode === '1' || mode === 'bad' || mode === 'short';
+      return json({ code: 0, data: { need_login_subtitle: mode === 'login', subtitle: { subtitles: has ? [{ lan: 'ai-zh', lan_doc: '中文（自动生成）', subtitle_url: SUB_URL }] : [] } } });
+    }
+    if (/hdslb\.com/.test(url)) return json({ body: trackBody() });
+    return json({ code: -404, message: 'mock: unknown api' });
+  };
+})();
+
 // ---------------------------------------------------------------- chrome.* shim
 (() => {
   const PROXY = (new URLSearchParams(location.search).get('proxy') || 'http://localhost:8787').replace(/\/+$/, '');
   const PERSIST_KEY = 'lb_harness_store';
-  const persisted = /^(hist:|past:|pendingRestore$|subGuide$|voiceEngine$|summaryAi$)/;
+  const persisted = /^(hist:|past:|kp:|pendingRestore$|subGuide$|voiceEngine$|summaryAi$|keyPoints$|kpTrack$|kpCue$)/;
   if (params.get('fresh') === '1') { try { localStorage.removeItem(PERSIST_KEY); } catch (_) {} }
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(PERSIST_KEY) || '{}'); } catch (_) {}
@@ -342,6 +489,9 @@ video.addEventListener('pause', () => (toggle.textContent = '播放'));
   window.__harnessStore = store;
   document.getElementById('clearHist').addEventListener('click', () => {
     storage.local.remove(Object.keys(store).filter((k) => /^(hist:|past:)/.test(k)));
+  });
+  document.getElementById('clearKp').addEventListener('click', () => {
+    storage.local.remove(Object.keys(store).filter((k) => /^kp:/.test(k)));
   });
 
   // ---------------- 假麦克风（?fakemic=1）/ 权限被拒（?mic=deny）

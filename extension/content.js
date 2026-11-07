@@ -11,6 +11,11 @@
  * - 语音追问改为「页面录音 → 本地代理 /asr 识别」（Chrome 自带识别要连 Google，国内用不了）。
  * - 抓不到字幕时的醒目指引：判断字幕为什么没有（没开 / 要登录 / 没有），播放中主动提醒、一键打开字幕、倒回重看。
  * - 历史节点：每次求助记一个节点（由扩展后台写入），带一句话说明；选节点 = 视频跳回去 + 还原当时的对话，可接着追问。
+ *
+ * v1.3：
+ * - 界面重新设计：暖象牙白 + 陶土橙 + 衬线正文 + 细线（docs/v1.3-方案.md 第一章）。
+ * - 课程重点：读完整字幕（B 站字幕接口，带用户自己的登录态）或边播边攒的字幕，分段交给本地代理 /keypoints（Call 5）
+ *   判定重点 → 进度条标记 + 抽屉「重点」列表 + 播放经过时提示 + 暂停时「附近重点」。存在 chrome.storage.local 的 kp:<视频ID>。
  */
 (() => {
   'use strict';
@@ -34,6 +39,7 @@
   const DEFAULT_SETTINGS = {
     proxyUrl: 'http://localhost:8787', sendImage: true, hardsub: true, voice: true, mode: 'direct',
     voiceEngine: 'local', subGuide: true, summaryAi: true, // v1.2
+    keyPoints: true, kpTrack: true, kpCue: true,             // v1.3 课程重点
   };
   const CONFUSED_RE = /还是不懂|没懂|不明白|听不懂|看不懂|不理解|晕/;
 
@@ -44,13 +50,14 @@
     session: null,
     explaining: false,
     subs: { videoId: null, entries: [], last: '' },
-    full: { videoId: null, status: 'idle', cues: [], tries: 0, at: 0, liveSent: 0, memory: null }, // v1.3 整片字幕
+    mem: { videoId: null, trackSent: null, liveSent: 0, info: null, stale: false, busy: false }, // v1.4 整片记忆
     lastDomSubAt: 0,
     frameTainted: false,
     hist: { videoId: null, nodes: [] },                       // 本视频的历史节点（缓存，以后台存储为准）
     guide: { videoId: null, played: 0, lastT: null, shown: false }, // 主动提醒的播放计时
     suppressAskUntil: 0,                                      // 回溯跳转时不弹「我这里不懂」
     pendingChecked: false,
+    kp: kpEmpty(null),                                        // v1.3 课程重点
   };
 
   // ------------------------------------------------------------------ 小工具
@@ -152,9 +159,12 @@
           if (k in DEFAULT_SETTINGS) state.settings[k] = v.newValue === undefined ? DEFAULT_SETTINGS[k] : v.newValue;
           // 后台写入了本视频的节点（新节点 / AI 一句话说明 / 别的标签页的追问）→ 刷新缓存
           if (k === 'hist:' + state.hist.videoId) setHistCache(state.hist.videoId, v.newValue);
+          // 设置页清空了重点标注 → 本页也清掉，继续播放会重新标注
+          if (k === 'kp:' + state.kp.videoId && v.newValue === undefined) { state.kp.points = []; state.kp.spans = []; state.kp.ruleReason = null; }
         }
         ui.syncMode();
         ui.syncVoice();
+        ui.syncKeypoints();
       });
     } catch (_) { /* 扩展上下文失效时忽略 */ }
   }
@@ -212,9 +222,6 @@
   function ensureSubsForVideo() {
     const id = getVideoId();
     if (state.subs.videoId !== id) state.subs = { videoId: id, entries: [], last: '' };
-    const f = state.full;
-    if (f.videoId !== id) loadFullSubs(id, 1);
-    else if (f.status === 'error' && f.tries < 3 && Date.now() - f.at > 60e3) loadFullSubs(id, f.tries + 1);
   }
 
   function observePlayer(v) {
@@ -261,15 +268,8 @@
   }
 
   function transcriptWindow(t) {
-    const f = state.full;
-    if (f.status === 'ok' && f.videoId === state.subs.videoId) {
-      // 有整片字幕：直接切 ±30 秒，暂停点之后的半分钟也有（边播边记只有播过的）
-      return f.cues
-        .filter((c) => c.to >= t - WINDOW_SEC && c.from <= t + WINDOW_SEC)
-        .map((c) => ({ t: c.from, text: c.text, src: 'full' }));
-    }
     const lastSeen = new Map();
-    return state.subs.entries
+    const live = state.subs.entries
       .filter((e) => e.t >= t - WINDOW_SEC && e.t <= t + WINDOW_SEC)
       .sort((a, b) => a.t - b.t)
       .filter((e) => {
@@ -277,102 +277,30 @@
         lastSeen.set(e.text, e.t);
         return prev === undefined || e.t - prev > 4; // 倒回去重看时同一句会被记两次
       });
+    // v1.3：这一段没播过（例如刚打开就拖到中间暂停），而本视频读到了完整字幕 → 用完整字幕补上
+    if (bodyLength(live.map((e) => e.text).join('')) < 20) {
+      const fromTrack = trackWindow(t);
+      if (fromTrack.length) return fromTrack;
+    }
+    return live;
   }
 
-  // ------------------------------------------------------------------ 整片字幕 → 分层记忆（v1.3 探索）
+  // ------------------------------------------------------------------ 整片记忆（v1.4）
   // 边播边记只有「播过的」字幕：暂停点后 30 秒没有，整部视频讲了什么也不知道。
-  // B 站的 CC / AI 字幕其实是一整份 JSON，可以一次拿全：
-  //   x/web-interface/view?bvid → aid、本分P的 cid → x/player/wbi/v2?aid&cid → subtitle_url → body[{from,to,content}]
-  // 拿到后：① 焦点窗口直接从整片字幕切，暂停点之后的半分钟也有；
-  //         ② 发给本地代理 /memory/build，后台生成分层记忆（小节摘要 + 全片大纲），
-  //            之后每次求助，代理按 t_sec 把「全局层 / 章节层 / 焦点层 / 回溯层」拼进提示词。
-  // 拿不到（没字幕 / AI 字幕要登录 / 番剧页）就退回边播边记；播过的字幕够多时也发一份 live 版本给代理。
-  const FULL_LIVE_MIN = 30;  // 边播边记至少 30 句才值得做记忆
-  const FULL_LIVE_STEP = 40; // 之后每多 40 句重发一次（代理只重做原文变了的小节）
+  // 字幕沿用课程重点（v1.3）读到的完整字幕 state.kp.track（B 站字幕接口，校验过时长、和播放器字幕比对过）；
+  // 读不到（没字幕 / AI 字幕要登录 / 番剧 / 设置里关了「读取完整字幕」）就在求助前把播过的字幕交给代理。
+  // 代理 /memory/build 在后台生成分层记忆（小节摘要 + 全片大纲）；之后每次求助，
+  // 代理按 t_sec 把「全局层 / 章节层 / 焦点层 / 回溯层」拼进提示词。
+  const MEM_LIVE_MIN = 30;   // 边播边记至少 30 句才值得做记忆
+  const MEM_LIVE_STEP = 40;  // 之后每多 40 句重发一次（代理只重做原文变了的小节）
 
-  function parseBiliId() {
-    const u = new URL(location.href);
-    const m = u.pathname.match(/\/video\/(BV[0-9A-Za-z]+|av\d+)/i);
-    if (!m) return null;
-    const p = Math.max(1, parseInt(u.searchParams.get('p') || '1', 10) || 1);
-    return /^av/i.test(m[1]) ? { aid: m[1].slice(2), p } : { bvid: m[1], p };
+  function memState() {
+    const id = state.subs.videoId;
+    if (state.mem.videoId !== id) state.mem = { videoId: id, trackSent: null, liveSent: 0, info: null, stale: false, busy: false, wait: 0 };
+    return state.mem;
   }
-
-  // 内容脚本直接取（带 B 站登录态，AI 字幕要登录）；被跨域拦了再交给后台取
-  async function getJson(url, withCookies) {
-    try {
-      const r = await fetch(url, { credentials: withCookies ? 'include' : 'omit' });
-      if (r.ok) return await r.json();
-    } catch (_) { /* 交给后台 */ }
-    const res = await bg({ type: 'fetchJson', url });
-    return res && res.ok ? res.data : null;
-  }
-
-  // 优先人工 CC 中文，其次 AI 中文
-  function pickSubtitle(list) {
-    const lan = (s) => String(s.lan || '').toLowerCase();
-    return list.find((s) => /^zh/.test(lan(s)))
-      || list.find((s) => /^ai-zh/.test(lan(s)))
-      || list.find((s) => /中文|汉语/.test(s.lan_doc || ''))
-      || list[0] || null;
-  }
-
-  async function fetchBiliSubtitles() {
-    const dev = document.getElementById('lb-dev-fullsubs'); // 开发自测页（dev/test-page.html?full=1）注入的整片字幕
-    if (dev) {
-      try {
-        const d = JSON.parse(dev.textContent);
-        return { status: 'ok', lan: d.lan || 'zh-CN', body: d.body || [], desc: d.desc || '', duration: d.duration || 0 };
-      } catch (_) { return { status: 'error', reason: 'dev_json' }; }
-    }
-    const id = parseBiliId();
-    if (!id) return { status: 'unsupported' };
-    const view = await getJson('https://api.bilibili.com/x/web-interface/view?' + (id.bvid ? 'bvid=' + id.bvid : 'aid=' + id.aid), true);
-    const vd = view && view.code === 0 && view.data;
-    if (!vd) return { status: 'error', reason: 'view' };
-    const pages = vd.pages || [];
-    const page = pages.find((x) => x.page === id.p) || pages[id.p - 1] || null;
-    const cid = page ? page.cid : vd.cid;
-    const meta = { desc: clip(vd.desc || '', 300), duration: (page && page.duration) || vd.duration || 0 };
-    let sub = null;
-    let needLogin = false;
-    for (const ep of ['x/player/wbi/v2', 'x/player/v2']) {
-      const pl = await getJson(`https://api.bilibili.com/${ep}?aid=${vd.aid}&cid=${cid}`, true);
-      const pd = pl && pl.code === 0 && pl.data;
-      if (!pd || (pd.cid && String(pd.cid) !== String(cid))) continue; // 偶尔会串到别的视频的字幕
-      if (pd.need_login_subtitle) needLogin = true;
-      const list = ((pd.subtitle && pd.subtitle.subtitles) || []).filter((s) => s && s.subtitle_url);
-      if (list.length) { sub = pickSubtitle(list); break; }
-    }
-    if (!sub) return { status: needLogin ? 'need_login' : 'none', ...meta };
-    const url = sub.subtitle_url.startsWith('//') ? 'https:' + sub.subtitle_url : sub.subtitle_url.replace(/^http:/, 'https:');
-    const file = await getJson(url, false);
-    const body = file && Array.isArray(file.body) ? file.body : null;
-    if (!body || !body.length) return { status: 'error', reason: 'subtitle_file', ...meta };
-    return { status: 'ok', lan: sub.lan || '', body, ...meta };
-  }
-
-  async function loadFullSubs(id, tries) {
-    const f = { videoId: id, status: 'loading', cues: [], lan: '', desc: '', duration: 0, tries, at: Date.now(), liveSent: 0, memory: null };
-    state.full = f;
-    let r;
-    try { r = await fetchBiliSubtitles(); } catch (e) { r = { status: 'error', reason: String((e && e.message) || e) }; }
-    if (state.full !== f) return; // 期间换了视频 / 分P
-    f.status = r.status;
-    f.at = Date.now();
-    f.desc = r.desc || '';
-    f.duration = r.duration || 0;
-    if (r.status === 'ok') {
-      f.lan = r.lan;
-      f.cues = r.body
-        .map((c) => ({ from: +c.from || 0, to: +c.to || +c.from || 0, text: String(c.content || '').replace(/\s+/g, ' ').trim() }))
-        .filter((c) => c.text)
-        .sort((a, b) => a.from - b.from);
-      if (f.cues.length < 5) f.status = 'none';
-    }
-    logEvent({ type: 'client_event', event: 'full_subs', video_id: id, status: f.status, reason: r.reason || null, lan: f.lan || null, cues: f.cues.length, tries });
-    if (f.status === 'ok') buildMemory('full');
-  }
+  // 旧版代理没有 /memory，或代理配置里关了整片记忆：这个视频不再发
+  const memOff = (m) => !!(m.info && (m.info.status === 'unsupported' || m.info.status === 'disabled'));
 
   // 边播边记的字幕 → [开始, 结束, 文本]（结束时间取下一句出现的时刻）
   function liveCues() {
@@ -384,35 +312,68 @@
     });
   }
 
-  async function buildMemory(source) {
-    const f = state.full;
-    const id = state.subs.videoId;
-    if (!id || f.videoId !== id) return;
-    const cues = source === 'full' ? f.cues.map((c) => [+c.from.toFixed(2), +c.to.toFixed(2), c.text]) : liveCues();
-    if (source === 'live') f.liveSent = state.subs.entries.length;
-    const v = state.video;
+  async function memBuild(source) {
+    const m = memState();
+    if (!m.videoId || m.busy || memOff(m)) return;
+    const tr = state.kp.track;
+    const fromTrack = source === 'track';
+    if (fromTrack && !kpTrackReady()) return;
+    const cues = fromTrack ? tr.lines.map((l) => [+l.from.toFixed(2), +l.to.toFixed(2), l.text]) : liveCues();
+    const force = !fromTrack && m.stale; // 之前用串台的完整字幕做过记忆：用播过的字幕整个重做
+    if (fromTrack) m.trackSent = tr.lines; else m.liveSent = state.subs.entries.length;
+    m.busy = true;
     const res = await callProxy('/memory/build', {
-      video_id: id,
+      video_id: m.videoId,
       subject: getSubject(),
-      desc: f.desc || '',
-      source: source === 'full' ? 'bilibili' : 'live',
-      lan: f.lan || '',
-      duration: f.duration || (v && Number.isFinite(v.duration) ? v.duration : 0),
+      desc: tr.desc || '',
+      source: fromTrack ? 'bilibili' : 'live',
+      lan: fromTrack ? tr.lan || '' : '',
+      duration: Math.round(kpDuration()),
       cues,
+      force,
     });
-    if (state.full !== f) return;
-    if (res.ok && res.data) f.memory = res.data;
-    else if (res.status === 404) f.memory = { status: 'unsupported' }; // 老版本代理没有 /memory
+    m.busy = false;
+    if (state.mem !== m) return;
+    if (res.ok && res.data) {
+      m.info = res.data;
+      if (force) m.stale = false;
+    } else if (res.status === 404) {
+      m.info = { status: 'unsupported' };
+    } else {
+      // 代理没开 / 出错：过一会儿再试
+      if (fromTrack) m.trackSent = null; else m.liveSent = 0;
+      m.wait = Date.now() + (res.unreachable ? 30e3 : 60e3);
+    }
   }
 
-  // 拿不到整片字幕时：求助前把播过的字幕发给代理（够多、且比上次多了一截才发）
-  function maybeBuildLive() {
-    const f = state.full;
-    if (f.videoId !== state.subs.videoId || f.status === 'ok' || f.status === 'loading') return;
-    if (f.memory && f.memory.status === 'unsupported') return;
+  // 每秒一次（和课程重点同一个节拍）：完整字幕读到了、确认是这个视频的，就交给代理做整片记忆
+  function memTick() {
+    const m = memState();
+    const k = state.kp;
+    const tr = k.track;
+    if (!m.videoId || m.busy || memOff(m) || Date.now() < m.wait) return;
+    if (m.trackSent && tr.status === 'mismatch') { m.stale = true; m.trackSent = null; } // 播放时发现完整字幕是别的视频的
+    if (!kpTrackReady() || m.trackSent === tr.lines) return;
+    if (k.played < KP_START_AFTER && !k.forced) return; // 点开看一眼的视频不花调用（求助时会直接发）
+    const v = state.video;
+    if (!tr.verified && k.played < 60 && v && !v.paused) {
+      // 和课程重点一样：播放器上正显示字幕时，先等攒够 3 句、确认完整字幕确实是这个视频的
+      const live = state.subs.entries.filter((e) => e.src !== 'ocr' && /[一-鿿]/.test(e.text)).length;
+      if (live > 0 && live < 3) return;
+    }
+    memBuild('track');
+  }
+
+  // 求助前：完整字幕还没交给代理就现在交；没有完整字幕时，把播过的字幕交给代理（够多、且比上次多了一截才发）
+  function memBeforeAsk() {
+    const m = memState();
+    if (!m.videoId || m.busy || memOff(m)) return;
+    const tr = state.kp.track;
+    if (kpTrackReady()) return m.trackSent === tr.lines ? undefined : memBuild('track');
+    if (tr.status === 'loading') return; // 完整字幕还在读：这次先不用记忆
     const n = state.subs.entries.length;
-    if (n < FULL_LIVE_MIN || (f.liveSent && n - f.liveSent < FULL_LIVE_STEP)) return;
-    return buildMemory('live'); // 代理只是切小节、起后台任务，很快返回；等它是为了这次求助就能用上
+    if (n < MEM_LIVE_MIN || (m.liveSent && n - m.liveSent < MEM_LIVE_STEP)) return;
+    return memBuild('live'); // 代理只是切小节、起后台任务，很快返回；等它是为了这次求助就能用上
   }
 
   // ------------------------------------------------------------------ 字幕状态与指引（v1.2 建议 1）
@@ -509,7 +470,7 @@
     g.lastT = t;
     if (g.shown || g.played < SUB_GUIDE_AFTER_SEC || state.settings.subGuide === false) return;
     if (state.subs.entries.length || ui.isOpen()) return;
-    if (state.full.videoId === id && state.full.status === 'ok') return; // 已经拿到整片字幕，不用打开播放器字幕
+    if (kpTrackReady()) return; // v1.3：读到了完整字幕，解释和重点都不依赖播放器字幕了
     const st = subtitleState();
     if (st === 'on') return;
     g.shown = true;
@@ -544,9 +505,8 @@
   // 识别到的字幕和 DOM 字幕一样按 currentTime 打点，进入 ±30 秒窗口。图片只发到本机代理，不上传。
   const hardsub = { busy: false, pauseUntil: 0, lastEntry: null, ready: null };
   const normSub = (s) => String(s || '').replace(/[\s，。、,.!?！？：:；;“”"'()（）[\]【】《》…·\-—_|]/g, '');
-  function similarSub(a, b) {
-    if (!a || !b) return false;
-    if (a === b || a.includes(b) || b.includes(a)) return true;
+  // 两句话的 2-gram 相似度（0~1）
+  function diceScore(a, b) {
     const grams = (s) => { const m = new Map(); for (let i = 0; i < s.length - 1; i++) { const g = s.slice(i, i + 2); m.set(g, (m.get(g) || 0) + 1); } return m; };
     const A = grams(a);
     const B = grams(b);
@@ -554,7 +514,12 @@
     let total = 0;
     for (const [g, n] of A) { inter += Math.min(n, B.get(g) || 0); total += n; }
     for (const n of B.values()) total += n;
-    return total > 0 && (2 * inter) / total >= 0.6; // 识别有错字时同一句前后两次读出来不完全一样
+    return total > 0 ? (2 * inter) / total : 0;
+  }
+  function similarSub(a, b, min = 0.6) {
+    if (!a || !b) return false;
+    if (a === b || a.includes(b) || b.includes(a)) return true;
+    return diceScore(a, b) >= min; // 识别有错字时同一句前后两次读出来不完全一样
   }
 
   function addHardsub(t, text) {
@@ -608,12 +573,13 @@
   // ------------------------------------------------------------------ 绑定视频
   const videoHandlers = {
     pause: () => onPaused(),
+    seeking: () => { state.kp.cueT = null; },
     seeked: () => { if (state.video && state.video.paused) onPaused(); },
     play: () => ui.hideAsk(),
     playing: () => ui.hideAsk(),
     ended: () => ui.hideAsk(),
     emptied: () => ui.hideAsk(),
-    timeupdate: () => scheduleScan(),
+    timeupdate: () => { scheduleScan(); kpCueCheck(); },
   };
 
   function bindVideo(v) {
@@ -630,7 +596,7 @@
     if (Date.now() < state.suppressAskUntil) return; // 回溯 / 倒回时自己触发的暂停、跳转
     // 这一段（±30 秒）没抓到字幕：按钮下方加一行提醒（v1.2）
     const noSubs = bodyLength(transcriptWindow(v.currentTime).map((e) => e.text).join('')) < 10;
-    ui.showAsk(v, { noSubs, histCount: state.hist.nodes.length });
+    ui.showAsk(v, { noSubs, histCount: state.hist.nodes.length, kpNear: kpNear(v.currentTime) });
   }
 
   // ------------------------------------------------------------------ 求助记录（规格 2.3 的 past3）
@@ -779,6 +745,513 @@
     restoreNode(node, 'options');
   }
 
+  // ------------------------------------------------------------------ 课程重点（v1.3 需求 2）
+  // 字幕两条来源：完整字幕（B 站字幕接口，全片，优先）；没有就用边播边攒的字幕（只能标已播放的部分）。
+  // 分段交给本地代理 /keypoints（Call 5）判定重点；结果存 chrome.storage.local 的 kp:<视频ID>，同一视频再打开直接读缓存。
+  // 展示：进度条标记（插在 B 站自己的进度条元素里，跟着控制条显示 / 隐藏 / 全屏走）、抽屉「重点」列表、
+  //       播放经过重点时的提示卡片、暂停时「附近重点」。
+  const KP_SEG_SEC = 300;          // 完整字幕按约 5 分钟一段
+  const KP_SEG_MIN_TAIL = 90;      // 最后不足 90 秒的并进上一段
+  const KP_AHEAD_SEC = 1800;       // 最多提前分析到当前位置后 30 分钟
+  const KP_START_AFTER = 10;       // 本视频累计播放 10 秒才开始（点开看一眼的视频不花调用）
+  const KP_LIVE_MIN_SEC = 150;     // 已播放字幕：攒够 150 秒且 ≥200 字，或攒到 1200 字，就分析这一段
+  const KP_LIVE_MIN_CHARS = 200;
+  const KP_LIVE_MAX_CHARS = 1200;
+  const KP_LIVE_CAP_CHARS = 2400;  // 一次最多送这么多字（代理没开时攒下的一大段分几次送）
+  const KP_GAP_SEC = 60;           // 字幕之间断开超过 60 秒（拖动跳过）算两段
+  const KP_MAX_VIDEOS = 150;
+  const KP_NEAR_BEFORE = 45;       // 暂停位置前 45 秒 ~ 后 15 秒内的重点算「附近重点」
+  const KP_NEAR_AFTER = 15;
+  const KP_KINDS = ['定义', '结论', '方法', '强调', '易错'];
+  const kpNoteOf = (p) => (p.note && !normSub(p.note).startsWith(normSub(String(p.title).replace(/…$/, ''))) ? p.note : '');
+
+  function kpEmpty(videoId) {
+    return {
+      videoId,
+      loaded: false,
+      points: [],        // { id, t, timestamp, title, note, kind, level: 1|2, src: 'ai'|'rule', source: 'track'|'live' }
+      spans: [],         // 已分析过的时间段 [from, to, source]
+      trackLan: null,
+      ruleReason: null,  // 有段落用了规则兜底的原因（no_api_key / upstream_error / parse_failed）
+      track: { status: 'idle', lines: [], segs: [], lan: null, lanDoc: null, duration: 0, desc: '', verified: false, checkedN: 0 },
+      played: 0,
+      lastT: null,
+      busy: null,        // 正在分析的段 { from, to }
+      wait: 0,
+      lastErr: null,
+      forced: false,     // 打开过重点面板：不等播放满 10 秒
+      forceLive: false,  // 点了【分析已播放部分】
+      cueT: null,
+    };
+  }
+
+  const kpTrackReady = () => state.kp.track.status === 'ok' && state.kp.videoId === state.subs.videoId;
+  function trackWindow(t) {
+    if (!kpTrackReady()) return [];
+    return state.kp.track.lines
+      .filter((l) => l.from >= t - WINDOW_SEC && l.from <= t + WINDOW_SEC)
+      .map((l) => ({ t: l.from, text: l.text, src: 'track' }));
+  }
+  function kpDuration() {
+    const v = state.video;
+    if (v && isFinite(v.duration) && v.duration > 0) return v.duration;
+    return state.kp.track.duration || 0;
+  }
+  const kpCoveredAt = (k, t) => k.spans.some((s) => s[0] <= t && t <= s[1]);
+  const kpCoveredSpan = (k, from, to) => k.spans.some((s) => s[0] <= from + 1 && s[1] >= to - 1);
+
+  // ---------------- 缓存
+  function kpLoad(videoId) {
+    const k = kpEmpty(videoId);
+    state.kp = k;
+    try {
+      chrome.storage.local.get({ ['kp:' + videoId]: null }, (o) => {
+        if (state.kp !== k) return;
+        const e = o && o['kp:' + videoId];
+        if (e) {
+          k.points = Array.isArray(e.points) ? e.points : [];
+          k.spans = Array.isArray(e.spans) ? e.spans : [];
+          k.trackLan = e.trackLan || null;
+          k.ruleReason = e.ruleReason || null;
+        }
+        k.loaded = true;
+        ui.syncKeypoints();
+      });
+    } catch (_) { k.loaded = true; }
+    ui.syncKeypoints();
+  }
+
+  let kpPruned = false;
+  function kpSave(k) {
+    const entry = { videoId: k.videoId, subject: getSubject(), points: k.points, spans: k.spans, trackLan: k.trackLan, ruleReason: k.ruleReason, updatedAt: Date.now() };
+    try { chrome.storage.local.set({ ['kp:' + k.videoId]: entry }); } catch (_) {}
+    if (kpPruned) return;
+    kpPruned = true; // 每个页面只清理一次：超过 150 个视频时删最久没更新的
+    try {
+      chrome.storage.local.get(null, (all) => {
+        if (!all) return;
+        const list = Object.keys(all).filter((x) => x.startsWith('kp:')).map((x) => [x, (all[x] && all[x].updatedAt) || 0]);
+        if (list.length <= KP_MAX_VIDEOS) return;
+        list.sort((a, b) => a[1] - b[1]);
+        chrome.storage.local.remove(list.slice(0, list.length - KP_MAX_VIDEOS).map((x) => x[0]));
+      });
+    } catch (_) {}
+  }
+
+  // ---------------- 完整字幕（和 B 站播放器自己取字幕走同一组接口，带用户自己的登录态）
+  function parseVideoRef(id) {
+    const m = /^(?:(BV[0-9A-Za-z]+)|av(\d+))(?:_p(\d+))?$/i.exec(id || '');
+    if (!m) return null; // 番剧（ep / ss）等接口不同，走「已播放字幕」
+    return { q: m[1] ? 'bvid=' + m[1] : 'aid=' + m[2], p: Number(m[3] || 1) };
+  }
+  async function getJson(url) {
+    const r = await fetch(url, { credentials: 'include' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }
+
+  async function kpFetchTrack(k) {
+    const tr = k.track;
+    const finish = (status, extra) => {
+      if (state.kp !== k) return;
+      Object.assign(tr, extra || {}, { status });
+      ui.syncKeypoints();
+      logEvent({
+        type: 'client_event', event: 'kp_track', result: status, video_id: k.videoId,
+        lan: tr.lan || null, lines: tr.lines.length, duration: Math.round(tr.duration || 0), error: (extra && extra.error) || null,
+      });
+    };
+    const ref = parseVideoRef(k.videoId);
+    if (!ref) { finish('unsupported'); return; }
+    tr.status = 'loading';
+    try {
+      const view = await getJson('https://api.bilibili.com/x/web-interface/view?' + ref.q);
+      if (!view || view.code !== 0 || !view.data) throw new Error('view code ' + (view && view.code));
+      const pages = view.data.pages || [];
+      const page = pages.find((x) => x.page === ref.p) || pages[ref.p - 1] || pages[0] || {};
+      const cid = page.cid || view.data.cid;
+      const duration = Number(page.duration || view.data.duration) || 0;
+      let info = null;
+      for (const path of ['/x/player/v2', '/x/player/wbi/v2']) {
+        try {
+          const pl = await getJson(`https://api.bilibili.com${path}?${ref.q}&cid=${cid}`);
+          if (pl && pl.code === 0 && pl.data) { info = pl.data; break; }
+        } catch (_) { /* 试下一个 */ }
+      }
+      if (!info) throw new Error('player api failed');
+      const subs = ((info.subtitle && info.subtitle.subtitles) || []).filter((x) => x && x.subtitle_url);
+      if (!subs.length) { finish(info.need_login_subtitle ? 'need_login' : 'none', { duration }); return; }
+      // 选字幕：人工中文 → AI 中文 → 其他中文 → 任意一条
+      const lanOf = (x) => String(x.lan || '').toLowerCase();
+      const pick = subs.find((x) => /^zh/.test(lanOf(x))) || subs.find((x) => /^ai-zh/.test(lanOf(x)))
+        || subs.find((x) => /中文|汉语/.test(x.lan_doc || '')) || subs[0];
+      let url = String(pick.subtitle_url);
+      if (url.startsWith('//')) url = 'https:' + url;
+      else if (url.startsWith('http://')) url = 'https://' + url.slice(7);
+      const file = await getJson(url);
+      const lines = ((file && file.body) || [])
+        .map((b) => ({ from: Number(b.from) || 0, to: Number(b.to) || Number(b.from) || 0, text: String(b.content || '').replace(/\s+/g, ' ').trim() }))
+        .filter((l) => l.text)
+        .sort((a, b) => a.from - b.from);
+      const dur = duration || kpDuration();
+      const last = lines.length ? lines[lines.length - 1].to : 0;
+      const meta = { lan: pick.lan || null, lanDoc: pick.lan_doc || null, duration: dur, desc: clip(String(view.data.desc || ''), 300) }; // desc：v1.4 整片记忆用
+      // 校验：这个接口出现过返回别的视频字幕的情况 → 行数太少、时长对不上就不用
+      if (lines.length < 10 || (dur > 0 && (last > dur + 30 || last < dur * 0.5))) {
+        finish('mismatch', { ...meta, error: `lines=${lines.length} last=${Math.round(last)}s duration=${Math.round(dur)}s` });
+        return;
+      }
+      k.trackLan = meta.lan;
+      finish('ok', { ...meta, lines, segs: kpSegments(lines) });
+    } catch (e) {
+      finish('error', { error: String((e && e.message) || e) });
+    }
+  }
+
+  // 播放器上实际出现过的字幕（≥3 句）里，至少一句要能在完整字幕 ±10 秒内找到相似句；一句都对不上 → 丢弃完整字幕
+  function kpVerifyTrack(k) {
+    const tr = k.track;
+    if (tr.status !== 'ok' || tr.verified) return;
+    const live = state.subs.entries.filter((e) => e.src !== 'ocr' && /[一-鿿]/.test(e.text)); // 画面识字有错字，不拿来判断
+    if (live.length < 3 || live.length === tr.checkedN) return;
+    tr.checkedN = live.length;
+    const sample = live.slice(-8);
+    const hit = sample.some((e) => {
+      const n = normSub(e.text);
+      return tr.lines.some((l) => Math.abs(l.from - e.t) <= 10 && similarSub(normSub(l.text), n, 0.5));
+    });
+    if (hit) { tr.verified = true; return; }
+    tr.status = 'mismatch';
+    tr.lines = [];
+    tr.segs = [];
+    k.points = k.points.filter((p) => p.source !== 'track');
+    k.spans = k.spans.filter((s) => s[2] !== 'track');
+    kpSave(k);
+    ui.syncKeypoints();
+    logEvent({ type: 'client_event', event: 'kp_track', result: 'mismatch', where: 'live_check', video_id: k.videoId, lan: tr.lan || null, sample: sample.length });
+  }
+
+  // ---------------- 分段
+  function kpSegments(lines) {
+    const segs = [];
+    let cur = null;
+    for (const l of lines) {
+      if (!cur || l.from - cur.from >= KP_SEG_SEC) { cur = { from: segs.length ? l.from : 0, to: l.to, lines: [] }; segs.push(cur); }
+      cur.lines.push(l);
+      cur.to = Math.max(cur.to, l.to);
+    }
+    const tail = segs[segs.length - 1];
+    if (segs.length > 1 && tail.to - tail.from < KP_SEG_MIN_TAIL) {
+      segs.pop();
+      const prev = segs[segs.length - 1];
+      prev.lines.push(...tail.lines);
+      prev.to = tail.to;
+    }
+    return segs;
+  }
+
+  // 完整字幕：先当前位置所在的段，再往后（最多 30 分钟），再往前补已经看过的
+  function kpNextSeg(k, t) {
+    const todo = k.track.segs.filter((s) => !kpCoveredSpan(k, s.from, s.to));
+    if (!todo.length) return null;
+    return todo.find((s) => t >= s.from && t < s.to)
+      || todo.find((s) => s.from >= t && s.from <= t + KP_AHEAD_SEC)
+      || todo.filter((s) => s.to <= t).pop()
+      || null;
+  }
+
+  // 已播放字幕：没分析过的字幕按时间连成一段段，够条件的拿出来分析
+  function kpLiveChunk(k, force) {
+    const v = state.video;
+    const now = v ? v.currentTime : 0;
+    const seen = new Set();
+    const es = state.subs.entries
+      .filter((e) => !kpCoveredAt(k, e.t))
+      .sort((a, b) => a.t - b.t)
+      .filter((e) => { const key = e.text + '@' + Math.round(e.t / 5); if (seen.has(key)) return false; seen.add(key); return true; });
+    const chunks = [];
+    let c = null;
+    for (const e of es) {
+      if (!c || e.t - c.to > KP_GAP_SEC) { c = { from: e.t, to: e.t, lines: [], chars: 0 }; chunks.push(c); }
+      c.lines.push(e);
+      c.to = e.t;
+      c.chars += bodyLength(e.text);
+    }
+    for (const ch of chunks) {
+      // 当前位置还在这一段里（正往下播）→ 它还在变长；已经离开（拖走了 / 播完了）就可以收尾
+      const open = !(v && v.ended) && now >= ch.from - 1 && now <= ch.to + KP_GAP_SEC;
+      const ready = (ch.to - ch.from >= KP_LIVE_MIN_SEC && ch.chars >= KP_LIVE_MIN_CHARS)
+        || ch.chars >= KP_LIVE_MAX_CHARS
+        || (!open && ch.chars >= 100)
+        || (force && ch.chars >= 30);
+      if (!ready) continue;
+      const lines = [];
+      let chars = 0;
+      for (const e of ch.lines) {
+        if (chars >= KP_LIVE_CAP_CHARS) break;
+        lines.push(e);
+        chars += bodyLength(e.text);
+      }
+      return { from: Math.max(0, lines[0].t - 0.5), to: lines[lines.length - 1].t + 0.5, lines: lines.map((e) => ({ t: e.t, text: e.text })), source: 'live' };
+    }
+    return null;
+  }
+
+  // ---------------- 调度：一次只跑一段，跑完歇 1.5 秒
+  async function kpPump() {
+    const k = state.kp;
+    const v = state.video;
+    if (!k.videoId || !k.loaded || k.busy || !v || state.settings.keyPoints === false) return;
+    if (Date.now() < k.wait) return;
+    if (k.played < KP_START_AFTER && !k.forced) return;
+    const tr = k.track;
+    if (tr.status === 'loading' || (tr.status === 'idle' && state.settings.kpTrack !== false)) return; // 等完整字幕的结果
+    let job = null;
+    if (tr.status === 'ok' && !tr.verified && k.played < 60 && !v.paused) {
+      // 播放器上正显示字幕：先等攒够 3 句、确认完整字幕确实是这个视频的再分析（免得白花一次调用）
+      const live = state.subs.entries.filter((e) => e.src !== 'ocr' && /[一-鿿]/.test(e.text)).length;
+      if (live > 0 && live < 3) return;
+    }
+    if (tr.status === 'ok') {
+      const seg = kpNextSeg(k, v.currentTime);
+      if (seg) job = { from: seg.from, to: seg.to, lines: seg.lines.map((l) => ({ t: l.from, text: l.text })), source: 'track' };
+    } else {
+      job = kpLiveChunk(k, k.forceLive || v.ended);
+      if (!job) k.forceLive = false;
+    }
+    if (job) await kpRun(k, job);
+  }
+
+  async function kpRun(k, job) {
+    k.busy = { from: job.from, to: job.to };
+    ui.tickKeypoints();
+    const res = await callProxy('/keypoints', {
+      video_id: k.videoId,
+      subject: getSubject(),
+      span_from: Math.floor(job.from),
+      span_to: Math.ceil(job.to),
+      duration: Math.round(kpDuration()),
+      lines: job.lines.map((l) => ({ t: Math.round(l.t * 10) / 10, text: l.text })),
+      known: k.points.map((p) => p.title).slice(-40),
+      source: job.source,
+    });
+    k.busy = null;
+    if (state.kp !== k) return;
+    if (!res.ok) {
+      // 代理没开 / 旧版代理没有 /keypoints / 扩展被重新加载：先歇一会儿，面板里写明原因
+      k.lastErr = res.extensionError ? 'extension' : res.unreachable ? 'unreachable' : res.status === 404 ? 'old_proxy' : 'error';
+      k.wait = Date.now() + (res.extensionError ? 3600e3 : res.unreachable ? 30e3 : res.status === 404 ? 600e3 : 60e3);
+      ui.syncKeypoints();
+      return;
+    }
+    const d = res.data || {};
+    k.lastErr = null;
+    if (d.source === 'rule' && d.fallback_reason) k.ruleReason = d.fallback_reason;
+    for (const p of Array.isArray(d.points) ? d.points : []) {
+      const t = Number(p.t);
+      if (!isFinite(t) || !p.title) continue;
+      if (k.points.some((q) => Math.abs(q.t - t) < 15)) continue;
+      k.points.push({
+        id: uid(),
+        t,
+        timestamp: fmt(t),
+        title: clip(p.title, 16),
+        note: clip(p.note || '', 40),
+        kind: KP_KINDS.includes(p.kind) ? p.kind : '强调',
+        level: Number(p.level) === 2 ? 2 : 1,
+        src: d.source === 'rule' ? 'rule' : 'ai',
+        source: job.source,
+      });
+    }
+    k.points.sort((a, b) => a.t - b.t);
+    k.spans.push([Math.round(job.from * 10) / 10, Math.round(job.to * 10) / 10, job.source]);
+    k.wait = Date.now() + 1500;
+    kpSave(k);
+    ui.syncKeypoints();
+  }
+
+  function kpTick() {
+    const id = state.subs.videoId;
+    if (!id) return;
+    if (state.kp.videoId !== id) kpLoad(id);
+    const k = state.kp;
+    const v = state.video;
+    if (v && !v.paused && !v.ended && !document.hidden) {
+      const t = v.currentTime;
+      if (k.lastT != null && t > k.lastT && t - k.lastT < 3) k.played += t - k.lastT;
+      k.lastT = t;
+    } else k.lastT = null;
+    // v1.4：整片记忆也用完整字幕，所以关掉课程重点也照读（只有关掉「读取完整字幕」才不读）
+    if (state.settings.kpTrack !== false && k.track.status === 'idle' && k.loaded) kpFetchTrack(k);
+    kpVerifyTrack(k);
+    if (state.settings.keyPoints !== false) kpPump();
+    memTick();
+    kpRenderMarkers();
+    ui.tickKeypoints();
+  }
+
+  // ---------------- 状态文字（重点面板底部 / 空列表）
+  const KP_TRACK_NOTE = {
+    need_login: '登录 B 站后能读取完整字幕，提前标出全片重点。',
+    none: '这个视频没有完整字幕。',
+    mismatch: '完整字幕和视频对不上，已改用播放时的字幕。',
+    error: '完整字幕读取失败。',
+  };
+  function kpStatus() {
+    const k = state.kp;
+    const tr = k.track;
+    const out = { text: '', warn: false, canRun: false, empty: '' };
+    if (state.settings.keyPoints === false) {
+      out.text = '课程重点标注已在设置里关闭。';
+      out.empty = '课程重点标注已关闭（设置页「课程重点」可以打开）。';
+      return out;
+    }
+    const dur = kpDuration();
+    const waitingTrack = tr.status === 'loading' || (tr.status === 'idle' && state.settings.kpTrack !== false);
+    const started = k.played >= KP_START_AFTER || k.forced;
+    let basis;
+    if (tr.status === 'ok') {
+      const done = tr.segs.filter((s) => kpCoveredSpan(k, s.from, s.to)).length;
+      basis = `依据完整字幕${tr.lanDoc ? `（${tr.lanDoc}）` : ''} · 已分析 ${done}/${tr.segs.length} 段${dur ? `（全长 ${fmt(dur)}）` : ''}`;
+    } else if (waitingTrack) {
+      basis = '正在读取完整字幕…';
+    } else {
+      const note = state.settings.kpTrack === false ? '设置里关了「读取完整字幕」。' : (KP_TRACK_NOTE[tr.status] || '');
+      basis = '依据已播放的字幕 · 继续播放会接着标注' + (note ? '。' + note : '');
+      out.canRun = !k.busy && !!kpLiveChunk(k, true);
+    }
+    if (k.busy) out.text = `正在分析 ${fmt(k.busy.from)}–${fmt(k.busy.to)}…`;
+    else if (k.lastErr === 'unreachable') { out.text = '连不上本地代理，标注先暂停（「启动.bat」开着就会自动继续）。'; out.warn = true; }
+    else if (k.lastErr === 'old_proxy') { out.text = '本地代理是旧版本，没有课程重点功能：关掉「启动.bat」窗口再重新打开。'; out.warn = true; }
+    else if (k.lastErr === 'extension') { out.text = '扩展刚被更新过，请刷新本页面。'; out.warn = true; }
+    else if (k.lastErr === 'error') { out.text = '这一段分析出错了，1 分钟后自动重试。'; out.warn = true; }
+    else if (k.ruleReason) {
+      out.text = basis + '。' + (k.ruleReason === 'no_api_key' ? '代理没配置 API Key，重点是按关键词粗略标的。' : '有的段落模型没给出可用结果，按关键词粗略标注。');
+      out.warn = k.ruleReason === 'no_api_key';
+    } else out.text = basis;
+    if (k.busy) out.empty = '正在读字幕找重点…';
+    else if (waitingTrack) out.empty = '正在读取完整字幕…';
+    else if (tr.status === 'ok') out.empty = k.spans.length ? '已经分析的部分没有找到明显的重点。' : started ? '正在读字幕找重点…' : '播放 10 秒后自动开始标注。';
+    else if (state.subs.entries.length) out.empty = '还没攒够字幕。继续播放会边播边标；也可以点下面的【分析已播放部分】。';
+    else out.empty = '还没抓到字幕。打开播放器的字幕继续播放，学习搭子会边播边标出重点。';
+    return out;
+  }
+
+  // ---------------- 交互
+  function kpNear(t) {
+    if (state.settings.keyPoints === false) return null;
+    let best = null;
+    for (const p of state.kp.points) {
+      if (p.t < t - KP_NEAR_BEFORE || p.t > t + KP_NEAR_AFTER) continue;
+      if (!best || Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
+    }
+    return best;
+  }
+
+  function kpJump(p, where) {
+    const v = findVideo() || state.video;
+    if (!v) return;
+    logEvent({ type: 'client_event', event: 'kp_jump', where, video_id: state.kp.videoId, t: Math.round(p.t), from: Math.round(v.currentTime), kind: p.kind, src: p.src });
+    if (ui.isOpen()) closeDrawer('kp_jump');
+    ui.hideAsk();
+    ui.hideKpCue();
+    state.suppressAskUntil = Date.now() + 800;
+    try { v.currentTime = Math.max(0, p.t - 2); } catch (_) {}
+    v.play().catch(() => {});
+  }
+
+  function openKeypoints(where) {
+    const k = state.kp;
+    k.forced = true; // 打开面板 = 立即开始标注，不用等播放满 10 秒
+    ui.hideAsk();
+    ui.showKeypoints();
+    logEvent({ type: 'client_event', event: 'kp_open', where, video_id: k.videoId, points: k.points.length, track: k.track.status });
+    kpPump();
+  }
+
+  function kpAnalyzeNow() {
+    const k = state.kp;
+    k.forced = true;
+    k.forceLive = true;
+    k.wait = 0;
+    k.lastErr = null;
+    kpPump();
+    ui.syncKeypoints();
+  }
+
+  // 播放正常经过一个重点（不是拖过去的）→ 视频左上角提示 5 秒
+  function kpCueCheck() {
+    const k = state.kp;
+    const v = state.video;
+    if (!v || v.paused || v.ended) { k.cueT = null; return; }
+    const t = v.currentTime;
+    const prev = k.cueT;
+    k.cueT = t;
+    if (prev == null || t <= prev || t - prev > 1.5) return;
+    if (state.settings.keyPoints === false || state.settings.kpCue === false || ui.isOpen() || document.hidden) return;
+    const p = k.points.find((x) => x.t > prev && x.t <= t);
+    if (!p) return;
+    ui.showKpCue(v, p);
+    logEvent({ type: 'client_event', event: 'kp_cue', action: 'shown', video_id: k.videoId, t: Math.round(p.t), kind: p.kind });
+  }
+
+  // ---------------- 进度条标记：插在 B 站自己的进度条里（鼠标移上去时的进度条 + 控制条收起时底部常驻的细进度条）
+  const kpBar = { layers: {}, bound: new WeakSet() };
+  const KP_BARS = [['.bpx-player-progress', 'main'], ['.bpx-player-shadow-progress-area', 'shadow']];
+
+  function kpRenderMarkers() {
+    const k = state.kp;
+    const dur = kpDuration();
+    const pts = state.settings.keyPoints !== false && dur > 0 && k.videoId === state.subs.videoId ? k.points : [];
+    const sig = `${k.videoId}|${Math.round(dur)}|${pts.map((p) => p.t + ':' + p.level).join(',')}`;
+    for (const [sel, kind] of KP_BARS) {
+      const bar = (state.playerRoot && state.playerRoot.querySelector(sel)) || document.querySelector(sel);
+      if (!bar) continue;
+      let layer = kpBar.layers[kind];
+      if (!layer || layer.parentNode !== bar) { // 第一次，或 B 站把进度条重绘掉了 → 补回来
+        if (layer) layer.remove();
+        layer = document.createElement('div');
+        layer.className = 'learn-buddy-kp';
+        layer.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;z-index:2;';
+        bar.appendChild(layer);
+        kpBar.layers[kind] = layer;
+        if (kind === 'main') kpBindHover(bar);
+      }
+      if (layer.dataset.sig === sig) continue;
+      layer.dataset.sig = sig;
+      layer.textContent = '';
+      for (const p of pts) {
+        const m = document.createElement('i');
+        const left = Math.max(0, Math.min(100, (p.t / dur) * 100)).toFixed(3) + '%';
+        m.style.cssText = kind === 'main' && p.level === 2
+          ? `position:absolute;left:${left};top:50%;width:8px;height:8px;transform:translate(-50%,-50%) rotate(45deg);background:#d97757;border:1px solid #faf9f5;border-radius:1px;box-sizing:border-box;`
+          : `position:absolute;left:${left};top:0;width:${kind === 'main' ? 3 : 2}px;height:100%;transform:translateX(-50%);background:#d97757;border-radius:1px;`;
+        layer.appendChild(m);
+      }
+    }
+  }
+
+  function kpBindHover(bar) {
+    const area = bar.closest('.bpx-player-progress-wrap') || bar;
+    if (kpBar.bound.has(area)) return;
+    kpBar.bound.add(area);
+    area.addEventListener('mousemove', (e) => {
+      const r = bar.getBoundingClientRect();
+      const dur = kpDuration();
+      if (!r.width || !dur || state.settings.keyPoints === false) { ui.hideKpTip(); return; }
+      let best = null;
+      let bestD = 8;
+      for (const p of state.kp.points) {
+        const x = r.left + (p.t / dur) * r.width;
+        const d = Math.abs(x - e.clientX);
+        if (d <= bestD) { bestD = d; best = { p, x }; }
+      }
+      if (best) ui.showKpTip(best.p, best.x, r);
+      else ui.hideKpTip();
+    });
+    area.addEventListener('mouseleave', () => ui.hideKpTip());
+  }
+
   // ------------------------------------------------------------------ 会话：Call 2
   function newSession(v, trigger) {
     ensureSubsForVideo();
@@ -798,6 +1271,7 @@
       transcript,
       degraded: bodyLength(transcript) < 10,
       subsFromScreen: entries.some((e) => e.src === 'ocr'),
+      subsFromTrack: entries.some((e) => e.src === 'track'),
       screenText: '',
       trigger,
       question: DEFAULT_QUESTION,
@@ -854,13 +1328,13 @@
     state.explaining = true;
     ui.renderLoading(s);
     const past = (await loadPast(s.videoId)).slice(-3).map((p) => ({ question: p.question, core: p.core }));
-    if (!s.restored) { try { await maybeBuildLive(); } catch (_) {} }
+    if (!s.restored) { try { await memBeforeAsk(); } catch (_) {} }
     const res = await callProxy('/explain', {
       session_id: s.id,
       video_id: s.videoId,
       subject: s.subject,
       timestamp: s.timestamp,
-      t_sec: s.t, // v1.3：代理按它从整片记忆里切焦点层、定位章节
+      t_sec: s.t, // v1.4：代理按它从整片记忆里切焦点层、定位章节
       transcript: s.transcript,
       question: s.question,
       past,
@@ -1257,23 +1731,36 @@
   })();
 
   // ------------------------------------------------------------------ 界面（Shadow DOM）
+  // v1.3 视觉：暖象牙白底 + 陶土橙一处点睛 + 衬线体读正文 + 细线代替阴影（只借鉴审美，不用任何品牌标志）。
+  // 不加载网络字体：拉丁字母走 Georgia，中文回落到本机的思源宋体 / 华文宋体 / 宋体。
   const CSS = `
 :host {
   all: initial;
-  --bg: #ffffff; --bg-soft: #f4f5f7; --ink: #18191c; --ink-2: #555b63; --ink-3: #8a9099;
-  --line: #e2e5e9; --accent: #0b7a68; --accent-hover: #09685a; --accent-soft: #e5f3f0; --on-accent: #ffffff;
-  --user: #eaf0fb; --warn: #8a4b06; --warn-soft: #fff4e0; --err: #b3261e; --err-soft: #fdeceb;
-  --amber: #d98a00; --on-amber: #ffffff;
-  --shadow: -16px 0 40px rgba(15, 20, 25, 0.14);
-  font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --bg: #faf9f5; --bg-soft: #f0eee6; --surface: #ffffff;
+  --ink: #141413; --ink-2: #5e5d59; --ink-3: #87867f;
+  --line: #e6e3da; --line-strong: #d6d2c6;
+  --accent: #c96442; --accent-hover: #b25536; --accent-soft: #f5e7e0; --on-accent: #ffffff;
+  --kraft: #d4a27f; --warn: #8a5a2b; --warn-soft: #f7efe2; --warn-line: #e9d6be;
+  --err: #b53d33; --err-soft: #f9e7e4; --olive: #6f8452;
+  --solid: #141413; --on-solid: #faf9f5;
+  --shadow: -12px 0 40px rgba(20, 20, 19, 0.10);
+  --float: 0 10px 30px rgba(20, 20, 19, 0.16);
+  --serif: Georgia, "Noto Serif SC", "Source Han Serif SC", "Source Han Serif CN", "Songti SC", STSong, SimSun, serif;
+  --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+  font-family: var(--sans);
 }
 @media (prefers-color-scheme: dark) {
   :host {
-    --bg: #1c1d21; --bg-soft: #26282d; --ink: #eceef1; --ink-2: #b4b9c0; --ink-3: #868c94;
-    --line: #34373d; --accent: #3fb8a2; --accent-hover: #5ccab5; --accent-soft: #1f3a35; --on-accent: #0d1715;
-    --user: #26324a; --warn: #f2c27b; --warn-soft: #3a2e1b; --err: #ff9a92; --err-soft: #3d2221;
-    --amber: #e8a640; --on-amber: #1c1300;
-    --shadow: -16px 0 40px rgba(0, 0, 0, 0.5);
+    --bg: #262624; --bg-soft: #30302e; --surface: #1f1e1d;
+    --ink: #faf9f5; --ink-2: #c2c0b6; --ink-3: #9c9a92;
+    --line: #3a3a36; --line-strong: #4a4944;
+    --accent: #d97757; --accent-hover: #e38b6d; --accent-soft: #3b2a23; --on-accent: #ffffff;
+    --kraft: #b98a66; --warn: #e2b48a; --warn-soft: #36302a; --warn-line: #4d4237;
+    --err: #f0938a; --err-soft: #3d2523; --olive: #a5b98a;
+    --solid: #faf9f5; --on-solid: #141413;
+    --shadow: -12px 0 40px rgba(0, 0, 0, 0.45);
+    --float: 0 10px 30px rgba(0, 0, 0, 0.5);
   }
 }
 * { box-sizing: border-box; }
@@ -1281,188 +1768,267 @@
 button { font: inherit; cursor: pointer; }
 button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
+/* ---------- 暂停时浮在视频上的按钮（视频总是深色，所以这里固定用深墨色） */
 .askwrap {
   position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
-  display: flex; flex-direction: column; align-items: center; gap: 8px;
-  animation: pop .18s ease-out;
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  animation: pop .2s ease-out;
 }
-.askhint { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px; max-width: 380px; }
-.askhint .nosub { padding: 4px 11px; border-radius: 999px; background: #ffc45c; color: #3a2400; font-size: 12px; font-weight: 600; box-shadow: 0 4px 14px rgba(0,0,0,0.3); }
-.askhint .histchip { padding: 4px 11px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.3); background: rgba(14,16,18,0.78); color: #fff; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.3); }
-.askhint .histchip:hover { background: rgba(11, 122, 104, 0.95); }
 .ask {
-  display: flex; align-items: center; gap: 10px;
-  padding: 12px 14px 12px 22px; border-radius: 999px;
-  border: 1px solid rgba(255,255,255,0.22); background: rgba(14, 16, 18, 0.82); color: #fff;
-  font-size: 16px; font-weight: 600; letter-spacing: 0.02em; white-space: nowrap;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.35); backdrop-filter: blur(8px);
-  transition: background .15s;
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px 12px 24px; border-radius: 999px;
+  border: 1px solid rgba(250, 249, 245, 0.18); background: rgba(20, 20, 19, 0.82); color: #faf9f5;
+  font: 500 17px/1.2 var(--serif); letter-spacing: 0.04em; white-space: nowrap;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.32); backdrop-filter: blur(10px);
+  transition: background .18s, border-color .18s;
 }
-.ask:hover { background: rgba(11, 122, 104, 0.95); }
+.ask:hover { background: #c96442; border-color: transparent; }
 .ask kbd {
-  font: 600 12px/1 ui-monospace, Consolas, monospace; padding: 5px 7px; border-radius: 6px;
-  background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.28);
+  font: 500 12px/1 var(--mono); padding: 5px 8px; border-radius: 999px;
+  background: rgba(250, 249, 245, 0.12); border: 1px solid rgba(250, 249, 245, 0.24);
 }
-@keyframes pop { from { opacity: 0; transform: translate(-50%, -46%) scale(.96); } }
+.askhint { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px; max-width: 420px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  padding: 5px 12px; border-radius: 999px; border: 1px solid rgba(250, 249, 245, 0.16);
+  background: rgba(20, 20, 19, 0.78); color: #faf9f5; font-size: 12px; line-height: 1.4;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28); backdrop-filter: blur(8px);
+}
+button.chip:hover { background: #c96442; border-color: transparent; }
+.chip.nosub { background: #f7efe2; color: #5a3a1a; border-color: #e9d6be; }
+.chip b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dia { flex: none; display: inline-block; width: 7px; height: 7px; border-radius: 1px; background: #d97757; transform: rotate(45deg); }
+button.chip:hover .dia { background: #faf9f5; }
+@keyframes pop { from { opacity: 0; transform: translate(-50%, -46%) scale(.97); } }
 
+/* ---------- 抽屉 */
 .drawer {
-  position: fixed; top: 0; right: 0; height: 100vh; width: min(380px, 100vw);
+  position: fixed; top: 0; right: 0; height: 100vh; width: min(400px, 100vw);
   display: flex; flex-direction: column;
   background: var(--bg); color: var(--ink); border-left: 1px solid var(--line); box-shadow: var(--shadow);
   font-size: 14px; line-height: 1.6;
-  transform: translateX(104%); transition: transform .22s ease;
+  transform: translateX(104%); transition: transform .26s cubic-bezier(.2, .8, .2, 1);
 }
 .drawer.open { transform: none; }
 
-.head { display: flex; align-items: flex-start; gap: 10px; padding: 14px 12px 12px 16px; border-bottom: 1px solid var(--line); }
+.head { display: flex; align-items: center; gap: 6px; padding: 16px 12px 14px 20px; border-bottom: 1px solid var(--line); }
 .head-main { flex: 1; min-width: 0; }
-.brand { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 700; }
+.brand { display: flex; align-items: center; gap: 9px; font: 600 17px/1.3 var(--serif); letter-spacing: 0.02em; }
 .brand .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
-.where { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 12px; color: var(--ink-2); min-width: 0; }
-.where .ts { flex: none; font: 600 12px/1.6 ui-monospace, Consolas, monospace; color: var(--accent); }
+.where { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 12px; color: var(--ink-3); min-width: 0; }
+.where .ts { flex: none; font: 500 12px/1.5 var(--mono); color: var(--accent); }
+.where .ts:empty { display: none; }
 .where .subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.icon { flex: none; width: 32px; height: 32px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-2); font-size: 16px; }
+.icon { flex: none; display: grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: 999px; background: transparent; color: var(--ink-3); }
 .icon:hover { background: var(--bg-soft); color: var(--ink); }
-.hbtn { flex: none; display: inline-flex; align-items: center; gap: 5px; height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--ink-2); font-size: 13px; }
-.hbtn:hover, .hbtn[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
-.badge { min-width: 18px; padding: 0 5px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; font-variant-numeric: tabular-nums; }
+.hbtn {
+  flex: none; display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 11px;
+  border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--ink-2); font-size: 12.5px;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.hbtn:hover { background: var(--bg-soft); color: var(--ink); }
+.hbtn[aria-pressed="true"] { background: var(--solid); border-color: var(--solid); color: var(--on-solid); }
+.badge { min-width: 16px; padding: 0 5px; border-radius: 999px; background: var(--bg-soft); color: var(--ink-2); font-size: 11px; font-weight: 600; line-height: 16px; text-align: center; font-variant-numeric: tabular-nums; }
+.kpbtn .badge { background: var(--accent-soft); color: var(--accent); }
+.hbtn[aria-pressed="true"] .badge { background: rgba(127, 127, 127, 0.28); color: inherit; }
 
-.scroll { flex: 1; overflow-y: auto; padding: 16px; overscroll-behavior: contain; }
-.restored { margin-bottom: 14px; padding: 7px 10px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 600; line-height: 1.6; }
-.guide { margin-bottom: 16px; padding: 12px 12px 10px; border: 1.5px solid var(--amber); border-radius: 10px; background: var(--warn-soft); }
-.guide h3 { display: flex; align-items: center; gap: 6px; margin: 0 0 2px; font-size: 15px; color: var(--warn); }
-.guide h3::before { content: "!"; display: inline-grid; place-items: center; width: 18px; height: 18px; border-radius: 50%; background: var(--amber); color: var(--on-amber); font-size: 12px; font-weight: 800; }
-.guide .why { font-size: 13px; color: var(--ink); }
-.guide ol { margin: 8px 0 0; padding-left: 20px; font-size: 13px; line-height: 1.7; color: var(--ink-2); }
-.guide .acts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
-.guide .acts button { padding: 6px 12px; border-radius: 8px; border: 1px solid var(--amber); background: var(--bg); color: var(--warn); font-size: 13px; font-weight: 600; }
-.guide .acts button.primary { background: var(--amber); color: var(--on-amber); }
-.guide .acts button:disabled { opacity: .6; cursor: default; }
-.guide .ok { color: var(--accent); font-size: 13px; font-weight: 700; }
-.guide .basis { margin-top: 8px; font-size: 11px; color: var(--ink-3); }
+.scroll { flex: 1; overflow-y: auto; padding: 20px 20px 28px; overscroll-behavior: contain; }
+.restored { margin-bottom: 18px; padding: 8px 12px; border-radius: 10px; background: var(--accent-soft); color: var(--accent); font-size: 12px; line-height: 1.6; }
 
-.seg + .seg { margin-top: 14px; }
-.tag { display: inline-block; margin-bottom: 4px; padding: 1px 7px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; }
-.seg p { margin: 0; font-size: 15px; line-height: 1.75; white-space: pre-wrap; word-break: break-word; }
-.seg.hook p { font-weight: 600; }
-.quick { display: flex; gap: 8px; margin-top: 10px; }
-.quick button { flex: 1; padding: 7px 0; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font-size: 13px; }
-.quick button:hover { border-color: var(--accent); color: var(--accent); }
+/* ---------- 抓不到字幕时的指引卡片 */
+.guide { margin-bottom: 22px; padding: 14px 16px 12px; border: 1px solid var(--warn-line); border-radius: 14px; background: var(--warn-soft); }
+.guide h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 4px; font: 600 15px/1.5 var(--serif); color: var(--ink); }
+.guide h3::before { content: ""; flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--kraft); }
+.guide .why { font-size: 13px; color: var(--ink-2); }
+.guide ol { margin: 10px 0 0; padding-left: 20px; font-size: 13px; line-height: 1.75; color: var(--ink-2); }
+.acts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+.acts button { padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line-strong); background: transparent; color: var(--ink); font-size: 12.5px; }
+.acts button:hover:not(:disabled) { background: var(--bg-soft); }
+.acts button.primary { background: var(--solid); border-color: var(--solid); color: var(--on-solid); }
+.acts button.primary:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.acts button.quiet { border-color: transparent; color: var(--ink-3); }
+.acts button:disabled { opacity: .55; cursor: default; }
+.ok { color: var(--olive); font-size: 13px; font-weight: 600; }
+.guide .basis { margin-top: 10px; font-size: 11px; color: var(--ink-3); }
+
+/* ---------- 三段解释 */
+.seg + .seg { margin-top: 18px; }
+.tag { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; font-size: 11.5px; font-weight: 500; letter-spacing: 0.08em; color: var(--ink-3); }
+.tag::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+.seg p { margin: 0; font: 400 16px/1.8 var(--serif); color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+.seg.hook { padding: 14px 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+.quick { display: flex; gap: 8px; margin-top: 12px; }
+.quick button { flex: 1; padding: 6px 0; border-radius: 999px; border: 1px solid var(--line-strong); background: transparent; color: var(--ink); font-size: 13px; transition: background .15s, color .15s; }
+.quick button:hover:not(:disabled) { background: var(--solid); border-color: var(--solid); color: var(--on-solid); }
 .quick button:disabled { opacity: .45; cursor: default; }
-.meta { margin-top: 12px; font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.meta { margin-top: 16px; font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .meta.warn { color: var(--warn); }
 
-.loading-text { color: var(--ink-2); font-size: 13px; margin-bottom: 12px; }
-.sk { height: 14px; margin: 10px 0; border-radius: 6px; background: linear-gradient(90deg, var(--bg-soft) 25%, var(--line) 50%, var(--bg-soft) 75%); background-size: 200% 100%; animation: shimmer 1.2s infinite linear; }
+.loading-text { margin-bottom: 14px; font: 15px/1.7 var(--serif); color: var(--ink-2); }
+.sk { height: 13px; margin: 12px 0; border-radius: 999px; background: linear-gradient(90deg, var(--bg-soft) 25%, var(--line) 50%, var(--bg-soft) 75%); background-size: 200% 100%; animation: shimmer 1.3s infinite linear; }
 .sk.short { width: 62%; }
 @keyframes shimmer { to { background-position: -200% 0; } }
 
-.error { padding: 10px 12px; border-radius: 8px; background: var(--err-soft); color: var(--err); font-size: 13px; line-height: 1.6; word-break: break-word; }
-.retry { margin-top: 10px; padding: 6px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font-size: 13px; }
+.error { padding: 10px 12px; border-radius: 10px; background: var(--err-soft); color: var(--err); font-size: 13px; line-height: 1.6; word-break: break-word; }
+.retry { margin-top: 12px; padding: 6px 16px; border-radius: 999px; border: 1px solid var(--line-strong); background: transparent; color: var(--ink); font-size: 13px; }
+.retry:hover { background: var(--bg-soft); }
 
-.thread { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
+/* ---------- 追问：用户浅色气泡，回答不加气泡、直接衬线排版 */
+.thread { display: flex; flex-direction: column; gap: 14px; margin-top: 26px; }
 .thread:empty { display: none; }
-.thread::before { content: "追问"; font-size: 11px; color: var(--ink-3); letter-spacing: .08em; padding-top: 12px; border-top: 1px dashed var(--line); }
-.turn { display: flex; flex-direction: column; gap: 6px; }
-.bubble { max-width: 92%; padding: 8px 12px; font-size: 14px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
-.bubble.user { align-self: flex-end; background: var(--user); border-radius: 12px 12px 4px 12px; }
-.bubble.bot { align-self: flex-start; background: var(--bg-soft); border-radius: 12px 12px 12px 4px; }
-.bubble.bot.redirect { background: var(--warn-soft); color: var(--warn); }
-.bubble .note { display: block; font-size: 11px; color: var(--ink-3); margin-bottom: 2px; }
-.bubble.streaming .text::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2, start) infinite; }
+.thread::before { content: "追问"; padding-top: 18px; border-top: 1px solid var(--line); font-size: 11.5px; font-weight: 500; letter-spacing: 0.08em; color: var(--ink-3); }
+.turn { display: flex; flex-direction: column; gap: 8px; }
+.bubble { font-size: 14px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+.bubble.user { align-self: flex-end; max-width: 86%; padding: 8px 14px; border-radius: 16px; background: var(--bg-soft); color: var(--ink); }
+.bubble.bot { align-self: stretch; padding: 0 2px; font: 15.5px/1.8 var(--serif); color: var(--ink); }
+.bubble.bot.redirect { padding: 8px 12px; border-radius: 12px; background: var(--warn-soft); color: var(--warn); font: 14px/1.7 var(--sans); }
+.bubble .note { display: block; margin-bottom: 2px; font: 11px/1.5 var(--sans); color: var(--ink-3); }
+.bubble.streaming .text::after { content: ""; display: inline-block; width: 8px; height: 8px; margin-left: 5px; border-radius: 50%; background: var(--accent); vertical-align: 0.05em; animation: breathe 1s ease-in-out infinite; }
 .bubble.waiting .text::before { content: "…"; color: var(--ink-3); }
-.turn .meta { margin-top: 0; padding-left: 4px; }
+.turn .meta { margin-top: 0; padding-left: 2px; }
 .turn .error { font-size: 12px; padding: 6px 10px; }
-@keyframes blink { to { visibility: hidden; } }
+@keyframes breathe { 50% { opacity: .25; transform: scale(.8); } }
 
-.foot { border-top: 1px solid var(--line); padding: 10px 12px 12px; background: var(--bg); }
-.tip { margin-bottom: 8px; font-size: 12px; color: var(--warn); }
-.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
-.chips button { padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg); color: var(--ink-2); font-size: 12px; }
-.chips button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+/* ---------- 底部：快捷回复 + 输入框 + 模式 */
+.foot { padding: 12px 16px 14px; border-top: 1px solid var(--line); background: var(--bg); }
+.tip { margin-bottom: 10px; padding: 7px 11px; border-radius: 10px; background: var(--warn-soft); color: var(--warn); font-size: 12px; line-height: 1.6; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.chips button { padding: 4px 11px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--ink-2); font-size: 12px; transition: background .15s, color .15s; }
+.chips button:hover:not(:disabled) { background: var(--bg-soft); color: var(--ink); border-color: var(--line-strong); }
 .chips button:disabled, .composer :disabled { opacity: .45; cursor: default; }
-.composer { display: flex; align-items: center; gap: 6px; padding: 4px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg-soft); }
-.composer:focus-within { border-color: var(--accent); }
+.composer {
+  display: flex; align-items: center; gap: 6px; padding: 5px 5px 5px 6px;
+  border: 1px solid var(--line-strong); border-radius: 16px; background: var(--surface);
+  box-shadow: 0 1px 2px rgba(20, 20, 19, 0.04), 0 6px 16px rgba(20, 20, 19, 0.04);
+  transition: border-color .15s;
+}
+.composer:focus-within { border-color: var(--ink-3); }
 .input { flex: 1; min-width: 0; padding: 8px 6px; border: 0; background: transparent; color: var(--ink); font: inherit; font-size: 14px; outline: none; }
 .input::placeholder { color: var(--ink-3); }
-.mic, .send { flex: none; display: grid; place-items: center; width: 34px; height: 34px; border: 0; border-radius: 9px; }
-.mic { background: transparent; color: var(--ink-2); }
-.mic:hover:not(:disabled) { background: var(--bg); color: var(--ink); }
+.mic, .send { flex: none; display: grid; place-items: center; width: 34px; height: 34px; border: 0; border-radius: 10px; }
+.mic { background: transparent; color: var(--ink-3); }
+.mic:hover:not(:disabled) { background: var(--bg-soft); color: var(--ink); }
 .mic.on { background: var(--err-soft); color: var(--err); box-shadow: 0 0 0 calc(2px + var(--lvl, 0) * 8px) var(--err-soft); transition: box-shadow .08s linear; }
 .mic.busy { color: var(--accent); animation: fade 0.9s ease-in-out infinite; }
-.send { background: var(--accent); color: var(--on-accent); }
+.send { background: var(--accent); color: var(--on-accent); transition: background .15s; }
 .send:hover:not(:disabled) { background: var(--accent-hover); }
 @keyframes fade { 50% { opacity: .35; } }
 .foot-row { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; }
-.mode { display: inline-flex; padding: 3px; border-radius: 9px; background: var(--bg-soft); }
-.mode button { padding: 4px 12px; border: 0; border-radius: 7px; background: transparent; color: var(--ink-2); font-size: 12px; }
-.mode button[aria-checked="true"] { background: var(--bg); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.12); }
-.resume { padding: 4px 6px; border: 0; background: transparent; color: var(--accent); font-size: 13px; font-weight: 600; }
-.resume:hover { color: var(--accent-hover); }
+.mode { display: inline-flex; padding: 3px; border-radius: 999px; background: var(--bg-soft); }
+.mode button { padding: 3px 13px; border: 0; border-radius: 999px; background: transparent; color: var(--ink-2); font-size: 12px; }
+.mode button[aria-checked="true"] { background: var(--surface); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(20, 20, 19, 0.14); }
+.resume { padding: 4px 6px; border: 0; background: transparent; color: var(--ink-2); font-size: 13px; }
+.resume:hover { color: var(--accent); }
 
-.histview { flex: 1; display: flex; flex-direction: column; min-height: 0; }
-.hv-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
-.hv-back { padding: 4px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--accent); font-size: 13px; font-weight: 600; }
-.hv-back:hover { background: var(--accent-soft); }
-.hv-title { font-size: 13px; font-weight: 600; color: var(--ink-2); }
-.hv-list { flex: 1; overflow-y: auto; padding: 8px 10px 16px; overscroll-behavior: contain; }
-.hv-empty { padding: 24px 8px; color: var(--ink-3); font-size: 13px; line-height: 1.7; }
-.node { position: relative; display: flex; gap: 10px; width: 100%; padding: 10px 10px 10px 8px; border: 0; border-radius: 10px; background: transparent; color: var(--ink); text-align: left; }
-.node::before { content: ""; position: absolute; left: 30px; top: 0; bottom: 0; width: 2px; background: var(--line); }
-.node:first-child::before { top: 20px; }
-.node:last-child::before { bottom: calc(100% - 20px); }
+/* ---------- 历史 / 重点面板（共用） */
+.panel { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.pv-head { display: flex; align-items: center; gap: 8px; padding: 10px 16px 10px 10px; border-bottom: 1px solid var(--line); }
+.pv-back { padding: 4px 10px; border: 0; border-radius: 999px; background: transparent; color: var(--ink-2); font-size: 13px; }
+.pv-back:hover { background: var(--bg-soft); color: var(--ink); }
+.pv-title { font: 600 14.5px/1.5 var(--serif); color: var(--ink); }
+.pv-list { flex: 1; overflow-y: auto; padding: 10px 12px 18px; overscroll-behavior: contain; }
+.pv-empty { padding: 28px 10px; color: var(--ink-3); font: 14px/1.8 var(--serif); }
+.pv-foot { display: flex; align-items: center; gap: 10px; padding: 10px 16px 14px; border-top: 1px solid var(--line); font-size: 12px; line-height: 1.6; color: var(--ink-3); }
+.pv-foot .kv-status { flex: 1; min-width: 0; }
+.pv-foot .kv-status.warn { color: var(--warn); }
+.pv-foot button { flex: none; padding: 5px 12px; border-radius: 999px; border: 1px solid var(--solid); background: var(--solid); color: var(--on-solid); font-size: 12px; }
+.pv-foot button:hover { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.n-ts { position: relative; z-index: 1; flex: none; align-self: flex-start; padding: 0 8px; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); font: 500 12px/1.7 var(--mono); color: var(--accent); }
+.n-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+
+.node { position: relative; display: flex; gap: 12px; width: 100%; padding: 11px 10px 11px 8px; border: 0; border-radius: 12px; background: transparent; color: var(--ink); text-align: left; }
+.node::before { content: ""; position: absolute; left: 34px; top: 0; bottom: 0; width: 1px; background: var(--line); }
+.node:first-child::before { top: 22px; }
+.node:last-child::before { bottom: calc(100% - 22px); }
 .node:only-child::before { display: none; }
 .node:hover { background: var(--bg-soft); }
 .node.current { background: var(--accent-soft); }
-.n-ts { position: relative; z-index: 1; flex: none; align-self: flex-start; padding: 1px 6px; border-radius: 6px; background: var(--bg); border: 1px solid var(--line); font: 600 12px/1.6 ui-monospace, Consolas, monospace; color: var(--accent); }
 .node.current .n-ts { border-color: var(--accent); }
-.n-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.n-sum { font-size: 14px; line-height: 1.55; word-break: break-word; }
+.n-sum { font: 14.5px/1.6 var(--serif); word-break: break-word; }
 .n-meta { font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
-.n-cur { flex: none; align-self: flex-start; padding: 1px 6px; border-radius: 4px; background: var(--accent); color: var(--on-accent); font-size: 11px; font-weight: 700; }
+.n-cur { flex: none; align-self: flex-start; padding: 0 8px; border-radius: 999px; background: var(--accent); color: var(--on-accent); font-size: 11px; line-height: 20px; }
 
+.kp { display: flex; gap: 12px; width: 100%; padding: 12px 10px; border: 0; border-radius: 12px; background: transparent; color: var(--ink); text-align: left; }
+.kp + .kp { margin-top: 2px; }
+.kp:hover { background: var(--bg-soft); }
+.kp.now { background: var(--accent-soft); }
+.kp.now .n-ts { border-color: var(--accent); }
+.kp-title { display: flex; align-items: center; gap: 8px; font: 600 15px/1.5 var(--serif); word-break: break-word; }
+.kp.core .kp-title::before { content: ""; flex: none; width: 7px; height: 7px; border-radius: 1px; background: var(--accent); transform: rotate(45deg); }
+.kp-note { font: 13.5px/1.7 var(--serif); color: var(--ink-2); word-break: break-word; }
+.kp-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+.kp-tags span { padding: 0 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 11px; line-height: 18px; color: var(--ink-3); }
+.kp-tags .core { border-color: var(--accent); color: var(--accent); }
+.kp-tags .asked { border-color: var(--olive); color: var(--olive); }
+
+/* ---------- 播放中的提示：字幕提醒条 / 字幕按钮圈 / 经过重点 / 进度条上的重点卡片 */
 .subtoast {
   position: fixed; left: 50%; top: 12px; transform: translateX(-50%); width: min(460px, calc(100vw - 32px));
-  padding: 12px 14px; border-radius: 12px; border: 1.5px solid #d98a00; background: #fff4e0; color: #3a2400;
-  font-size: 13px; line-height: 1.6; box-shadow: 0 10px 30px rgba(0,0,0,0.3); animation: drop .2s ease-out;
+  padding: 12px 16px 12px 18px; border-radius: 14px; border: 1px solid var(--warn-line); border-left: 4px solid var(--kraft);
+  background: var(--bg); color: var(--ink-2); font-size: 13px; line-height: 1.65; box-shadow: var(--float); animation: drop .22s ease-out;
 }
-.subtoast b { display: block; margin-bottom: 2px; font-size: 14px; color: #8a4b06; }
-.subtoast .acts { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 8px; }
-.subtoast button { padding: 5px 12px; border-radius: 8px; border: 1px solid #d98a00; background: transparent; color: #8a4b06; font-size: 12px; font-weight: 600; }
-.subtoast button.primary { background: #d98a00; color: #fff; }
-.subtoast button.quiet { border-color: transparent; color: #8a6a3a; font-weight: 400; }
-.subtoast button:disabled { opacity: .6; cursor: default; }
+.subtoast b { display: block; margin-bottom: 2px; font: 600 15px/1.5 var(--serif); color: var(--ink); }
+.subtoast .acts { justify-content: flex-end; margin-top: 10px; }
 @keyframes drop { from { opacity: 0; transform: translate(-50%, -8px); } }
-.subring { position: fixed; border: 3px solid #ffb020; border-radius: 10px; pointer-events: none; animation: ring 1s ease-in-out infinite; }
-.subring span { position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); padding: 4px 10px; border-radius: 6px; background: #ffb020; color: #2a1a00; font-size: 12px; font-weight: 700; white-space: nowrap; }
-@keyframes ring { 0%, 100% { box-shadow: 0 0 0 0 rgba(255,176,32,.6); } 50% { box-shadow: 0 0 0 10px rgba(255,176,32,0); } }
+.subring { position: fixed; border: 2px solid #d97757; border-radius: 10px; pointer-events: none; animation: ring 1.1s ease-in-out infinite; }
+.subring span { position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); padding: 4px 11px; border-radius: 999px; background: #d97757; color: #fff; font-size: 12px; font-weight: 600; white-space: nowrap; }
+@keyframes ring { 0%, 100% { box-shadow: 0 0 0 0 rgba(217, 119, 87, .55); } 50% { box-shadow: 0 0 0 10px rgba(217, 119, 87, 0); } }
+
+.kpcue {
+  position: fixed; display: flex; align-items: center; gap: 10px; max-width: min(380px, calc(100vw - 32px));
+  padding: 9px 16px 9px 13px; border-radius: 12px; border: 1px solid rgba(250, 249, 245, 0.14);
+  background: rgba(20, 20, 19, 0.84); color: #faf9f5; text-align: left;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.3); backdrop-filter: blur(10px); animation: slidein .26s ease-out;
+}
+.kpcue:hover { background: rgba(20, 20, 19, 0.94); border-color: rgba(217, 119, 87, 0.7); }
+.kpcue .lbl { flex: none; font-size: 11px; letter-spacing: 0.08em; color: #e8a68c; }
+.kpcue .ttl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 600 14px/1.4 var(--serif); }
+@keyframes slidein { from { opacity: 0; transform: translateX(-8px); } }
+.kptip {
+  position: fixed; transform: translate(-50%, -100%); width: max-content; max-width: 260px;
+  padding: 9px 13px 10px; border-radius: 12px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--ink); box-shadow: var(--float); pointer-events: none;
+}
+.kptip .k { display: flex; align-items: center; gap: 6px; font-size: 11px; letter-spacing: 0.06em; color: var(--accent); }
+.kptip .t { margin-top: 2px; font: 600 14px/1.45 var(--serif); }
+.kptip .n { margin-top: 2px; font: 12.5px/1.6 var(--serif); color: var(--ink-2); }
 `;
 
-  const MIC_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>';
-  const SEND_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
+  const MIC_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>';
+  const SEND_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg>';
+  const CLOSE_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>';
 
   const HTML = `
 <div class="askwrap" hidden>
   <button class="ask" type="button" aria-label="我这里不懂（快捷键 1）"><span>我这里不懂</span><kbd>1</kbd></button>
   <div class="askhint" hidden>
-    <span class="nosub" hidden>这段没抓到字幕，解释可能不准</span>
-    <button class="histchip" type="button" hidden title="看本视频的历史节点">历史 <b>0</b></button>
+    <span class="chip nosub" hidden>这段没抓到字幕，解释可能不准</span>
+    <button class="chip kpchip" type="button" hidden title="打开本视频的课程重点"><i class="dia"></i><span>附近重点</span><b></b></button>
+    <button class="chip histchip" type="button" hidden title="看本视频的历史节点">历史 <b>0</b></button>
   </div>
 </div>
 <div class="subtoast" hidden role="status"></div>
 <div class="subring" hidden><span>点这里打开字幕</span></div>
+<button class="kpcue" type="button" hidden title="打开本视频的课程重点"><i class="dia"></i><span class="lbl">重点</span><span class="ttl"></span></button>
+<div class="kptip" hidden></div>
 <aside class="drawer" hidden role="dialog" aria-label="学习搭子">
   <header class="head">
     <div class="head-main">
       <div class="brand"><span class="dot"></span>学习搭子</div>
       <div class="where"><span class="ts"></span><span class="subject"></span></div>
     </div>
+    <button class="hbtn kpbtn" type="button" title="课程重点：根据字幕判定的重点位置，点一条跳过去" aria-label="课程重点" aria-pressed="false">重点<span class="badge" hidden>0</span></button>
     <button class="hbtn hist" type="button" title="历史节点：每次求助都会记一个节点，点开可以跳回去" aria-label="历史节点" aria-pressed="false">历史<span class="badge" hidden>0</span></button>
-    <button class="icon close" type="button" title="关闭（Esc）" aria-label="关闭">✕</button>
+    <button class="icon close" type="button" title="关闭（Esc）" aria-label="关闭">${CLOSE_SVG}</button>
   </header>
-  <section class="histview" hidden aria-label="历史节点">
-    <div class="hv-head"><button class="hv-back" type="button">‹ 返回</button><span class="hv-title"></span></div>
-    <div class="hv-list"></div>
+  <section class="panel histview" hidden aria-label="历史节点">
+    <div class="pv-head"><button class="pv-back" type="button">‹ 返回</button><span class="pv-title"></span></div>
+    <div class="pv-list"></div>
+  </section>
+  <section class="panel kpview" hidden aria-label="课程重点">
+    <div class="pv-head"><button class="pv-back" type="button">‹ 返回</button><span class="pv-title"></span></div>
+    <div class="pv-list"></div>
+    <div class="pv-foot"><span class="kv-status"></span><button class="kv-run" type="button" hidden>分析已播放部分</button></div>
   </section>
   <div class="scroll">
     <div class="restored" hidden></div>
@@ -1488,7 +2054,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
         <button type="button" role="radio" data-mode="direct" title="直接给短答案">直说</button>
         <button type="button" role="radio" data-mode="socratic" title="不直接给答案，一次问你一个小问题">带我想</button>
       </div>
-      <button class="resume" type="button">继续播放 ▸</button>
+      <button class="resume" type="button">继续播放 ›</button>
     </div>
   </footer>
 </aside>`;
@@ -1516,8 +2082,20 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
     const histBtn = $('.hist');
     const histBadge = $('.hist .badge');
     const histView = $('.histview');
-    const hvTitle = $('.hv-title');
-    const hvList = $('.hv-list');
+    const hvTitle = $('.histview .pv-title');
+    const hvList = $('.histview .pv-list');
+    const kpChip = $('.kpchip');
+    const kpBtn = $('.kpbtn');
+    const kpBadge = $('.kpbtn .badge');
+    const kpView = $('.kpview');
+    const kvTitle = $('.kpview .pv-title');
+    const kvList = $('.kpview .pv-list');
+    const kvStatus = $('.kv-status');
+    const kvRun = $('.kv-run');
+    const kpCue = $('.kpcue');
+    const kpTip = $('.kptip');
+    let cueVideo = null;
+    let cueTimer = 0;
     const foot = $('.foot');
     const tip = $('.tip');
     const input = $('.input');
@@ -1608,7 +2186,16 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
     askBtn.addEventListener('click', () => startExplain('button'));
     histChip.addEventListener('click', () => openHistory('ask'));
     histBtn.addEventListener('click', () => (histView.hidden ? openHistory('drawer') : backFromHistory()));
-    $('.hv-back').addEventListener('click', () => backFromHistory());
+    $('.histview .pv-back').addEventListener('click', () => backFromHistory());
+    kpChip.addEventListener('click', () => openKeypoints('ask'));
+    kpBtn.addEventListener('click', () => (kpView.hidden ? openKeypoints('drawer') : backFromHistory()));
+    $('.kpview .pv-back').addEventListener('click', () => backFromHistory());
+    kvRun.addEventListener('click', () => kpAnalyzeNow());
+    kpCue.addEventListener('click', () => {
+      logEvent({ type: 'client_event', event: 'kp_cue', action: 'click', video_id: state.kp.videoId });
+      hideKpCue();
+      openKeypoints('cue');
+    });
     $('.close').addEventListener('click', () => closeDrawer('close_button'));
     $('.resume').addEventListener('click', () => { const v = state.video; if (v) v.play().catch(() => {}); });
     sendBtn.addEventListener('click', submitInput);
@@ -1620,11 +2207,56 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
     for (const b of root.querySelectorAll('.mode button')) b.addEventListener('click', () => setMode(b.dataset.mode));
     subToast.addEventListener('mouseenter', () => clearTimeout(toastTimer));
     subToast.addEventListener('mouseleave', () => { clearTimeout(toastTimer); toastTimer = setTimeout(() => hideToast('timeout'), 5000); });
-    const placeAll = () => { placeAsk(); placeToast(); placeRing(); };
+    kpCue.addEventListener('mouseenter', () => clearTimeout(cueTimer));
+    kpCue.addEventListener('mouseleave', () => { clearTimeout(cueTimer); cueTimer = setTimeout(hideKpCue, 2500); });
+    const placeAll = () => { placeAsk(); placeToast(); placeRing(); placeCue(); };
     window.addEventListener('resize', placeAll);
     window.addEventListener('scroll', placeAll, { passive: true });
-    document.addEventListener('fullscreenchange', () => { mount(); setTimeout(placeAll, 120); });
-    setInterval(() => { if (!askWrap.hidden || !subToast.hidden || !subRing.hidden) placeAll(); }, 400);
+    document.addEventListener('fullscreenchange', () => { mount(); hideKpTip(); setTimeout(placeAll, 120); });
+    setInterval(() => { if (!askWrap.hidden || !subToast.hidden || !subRing.hidden || !kpCue.hidden) placeAll(); }, 400);
+
+    // ---------------- 课程重点：播放经过时的提示卡片、进度条上的说明卡片（v1.3）
+    function placeCue() {
+      if (kpCue.hidden) return;
+      const r = visibleRect(cueVideo);
+      if (!r) { kpCue.style.visibility = 'hidden'; return; }
+      kpCue.style.visibility = '';
+      kpCue.style.left = `${r.left + 14}px`;
+      kpCue.style.top = `${Math.max(8, r.top + 14)}px`;
+    }
+    function hideKpCue() { clearTimeout(cueTimer); kpCue.hidden = true; cueVideo = null; }
+    function showKpCue(v, p) {
+      mount();
+      cueVideo = v;
+      kpCue.querySelector('.lbl').textContent = p.level === 2 ? '核心重点' : '重点';
+      kpCue.querySelector('.ttl').textContent = p.title;
+      kpCue.title = (kpNoteOf(p) ? kpNoteOf(p) + '\n' : '') + '点开看本视频的全部重点';
+      kpCue.hidden = false;
+      placeCue();
+      clearTimeout(cueTimer);
+      cueTimer = setTimeout(hideKpCue, 5000);
+    }
+    function hideKpTip() { kpTip.hidden = true; }
+    // x：标记在屏幕上的横坐标；bar：进度条矩形。B 站自己的预览小窗（缩略图 + 时间）显示时，放在它上面，不挡住它
+    function showKpTip(p, x, bar) {
+      mount();
+      kpTip.textContent = '';
+      kpTip.append(h('div', { class: 'k' }, h('i', { class: 'dia' }), `${p.level === 2 ? '核心重点' : '重点'} · ${p.timestamp} · ${p.kind}`), h('div', { class: 't' }, p.title));
+      if (kpNoteOf(p)) kpTip.append(h('div', { class: 'n' }, kpNoteOf(p)));
+      kpTip.hidden = false;
+      let top = bar.top;
+      const pop = (state.playerRoot || document).querySelector('.bpx-player-progress-popup');
+      if (pop) {
+        const pr = pop.getBoundingClientRect();
+        let shown = pr.width > 0 && pr.height > 0 && pr.bottom <= bar.top + 4;
+        try { const cs = getComputedStyle(pop); if (cs.visibility === 'hidden' || cs.display === 'none' || Number(cs.opacity) === 0) shown = false; } catch (_) {}
+        if (shown) top = Math.min(top, pr.top);
+      }
+      const w = kpTip.offsetWidth || 220;
+      const left = Math.max(8 + w / 2, Math.min(window.innerWidth - 8 - w / 2, x));
+      kpTip.style.left = `${left}px`;
+      kpTip.style.top = `${Math.max(kpTip.offsetHeight + 8, top - 10)}px`;
+    }
 
     function segmentView(s) {
       const d = s.call2;
@@ -1648,12 +2280,12 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
       if (d.retried) metaBits.push('已重试');
       metaBits.push(d.vision_used ? '看了画面' : d.ocr_used ? '读了画面文字' : '未用画面');
       if (s.subsFromScreen) metaBits.push('字幕取自画面');
-      const m = d.memory;
+      const m = d.memory; // v1.4 整片记忆
       if (m && m.used) {
         metaBits.push(m.status === 'ready' || m.status === 'partial'
           ? `整片记忆${m.chapters ? ` · ${m.chapters} 章` : ''}${m.chapter ? `「${m.chapter}」` : ''}`
           : m.status === 'building' ? '整片记忆生成中' : '整片字幕');
-      }
+      } else if (s.subsFromTrack) metaBits.push('字幕取自完整字幕');
       if (d.total_ms) metaBits.push(`${(d.total_ms / 1000).toFixed(1)}s`);
       out.push(h('div', { class: 'meta' + (d.length_violation ? ' warn' : '') }, metaBits.join(' · ')));
       return out;
@@ -1777,7 +2409,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
       hvTitle.textContent = `本视频的学习历史（${nodes.length}）`;
       hvList.textContent = '';
       if (!nodes.length) {
-        hvList.append(h('div', { class: 'hv-empty' }, '还没有记录。暂停后点「我这里不懂」或按 1，每次求助都会记成一个节点，之后可以从这里跳回去接着问。'));
+        hvList.append(h('div', { class: 'pv-empty' }, '还没有记录。暂停后点「我这里不懂」或按 1，每次求助都会记成一个节点，之后可以从这里跳回去接着问。'));
         return;
       }
       const cur = state.session && !state.session.closed ? state.session.nodeId : null;
@@ -1811,11 +2443,83 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
       drawer.classList.add('open');
     }
 
+    // ---------------- 课程重点列表（v1.3）
+    function kpCurrentId() {
+      const v = state.video;
+      if (!v) return null;
+      const now = v.currentTime + 2;
+      let id = null;
+      for (const p of state.kp.points) if (p.t <= now) id = p.id;
+      return id;
+    }
+
+    function renderKeypoints() {
+      const k = state.kp;
+      const pts = state.settings.keyPoints === false ? [] : k.points;
+      kvTitle.textContent = `本视频的课程重点（${pts.length}）`;
+      kvList.textContent = '';
+      const st = kpStatus();
+      kvStatus.textContent = st.text;
+      kvStatus.classList.toggle('warn', !!st.warn);
+      kvRun.hidden = !st.canRun;
+      if (!pts.length) {
+        kvList.append(h('div', { class: 'pv-empty' }, st.empty));
+        return;
+      }
+      const cur = kpCurrentId();
+      for (const p of pts) {
+        const asked = state.hist.nodes.some((n) => n.t >= p.t - 15 && n.t <= p.t + 45);
+        kvList.append(h('button', {
+          type: 'button',
+          class: 'kp' + (p.id === cur ? ' now' : '') + (p.level === 2 ? ' core' : ''),
+          'data-id': p.id,
+          title: `跳到 ${p.timestamp} 开始播放`,
+          onclick: () => kpJump(p, 'panel'),
+        },
+        h('span', { class: 'n-ts' }, p.timestamp),
+        h('span', { class: 'n-body' },
+          h('span', { class: 'kp-title' }, p.title),
+          kpNoteOf(p) ? h('span', { class: 'kp-note' }, kpNoteOf(p)) : null,
+          h('span', { class: 'kp-tags' },
+            h('span', null, p.kind || '强调'),
+            p.level === 2 ? h('span', { class: 'core' }, '核心') : null,
+            asked ? h('span', { class: 'asked', title: '你在这附近求助过' }, '求助过') : null,
+            p.src === 'rule' ? h('span', { title: '模型没返回可用结果时，按「重点 / 注意 / 定义」等关键词粗略标注的' }, '关键词') : null))));
+      }
+    }
+
+    // 只刷新「当前播放位置所在的那条」的高亮，不重建列表（避免鼠标悬停时闪）
+    function tickKeypoints() {
+      if (kpView.hidden) return;
+      const cur = kpCurrentId();
+      for (const b of kvList.querySelectorAll('.kp')) b.classList.toggle('now', b.dataset.id === cur);
+      const st = kpStatus();
+      if (kvStatus.textContent !== st.text) {
+        kvStatus.textContent = st.text;
+        kvStatus.classList.toggle('warn', !!st.warn);
+      }
+      kvRun.hidden = !st.canRun;
+    }
+
+    function showPanel(which) {
+      openShell();
+      histView.hidden = which !== 'hist';
+      kpView.hidden = which !== 'kp';
+      scroller.hidden = true;
+      foot.hidden = true;
+      histBtn.setAttribute('aria-pressed', String(which === 'hist'));
+      kpBtn.setAttribute('aria-pressed', String(which === 'kp'));
+      if (which === 'hist') renderHistory();
+      else renderKeypoints();
+    }
+
     function showChat() {
       histView.hidden = true;
+      kpView.hidden = true;
       scroller.hidden = false;
       foot.hidden = false;
       histBtn.setAttribute('aria-pressed', 'false');
+      kpBtn.setAttribute('aria-pressed', 'false');
     }
 
     function backFromHistory() {
@@ -1872,8 +2576,14 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
         const n = o.histCount || 0;
         histChip.hidden = !n;
         histChip.querySelector('b').textContent = String(n);
-        askHint.hidden = askNoSub.hidden && histChip.hidden;
+        kpChip.hidden = !o.kpNear;
+        if (o.kpNear) {
+          kpChip.querySelector('b').textContent = clip(o.kpNear.title, 14);
+          kpChip.title = `附近重点 ${o.kpNear.timestamp}：${o.kpNear.title}${kpNoteOf(o.kpNear) ? '\n' + kpNoteOf(o.kpNear) : ''}\n点开看本视频的全部重点`;
+        }
+        askHint.hidden = askNoSub.hidden && histChip.hidden && kpChip.hidden;
         askWrap.hidden = false;
+        hideKpCue();
         placeAsk();
       },
       hideAsk() { askWrap.hidden = true; askVideo = null; },
@@ -1884,6 +2594,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
         mount();
         clearTimeout(closeTimer);
         hideToast();
+        hideKpCue();
         showChat();
         $('.ts').textContent = s.timestamp;
         $('.subject').textContent = s.subject;
@@ -1928,15 +2639,24 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
         restored.hidden = false;
         scroller.scrollTop = 0;
       },
-      showHistory() {
-        openShell();
-        renderHistory();
-        histView.hidden = false;
-        scroller.hidden = true;
-        foot.hidden = true;
-        histBtn.setAttribute('aria-pressed', 'true');
-      },
+      showHistory() { showPanel('hist'); },
+      showKeypoints() { hideKpCue(); showPanel('kp'); },
       showChat,
+      showKpCue,
+      hideKpCue,
+      showKpTip,
+      hideKpTip,
+      tickKeypoints,
+      syncKeypoints() {
+        const on = state.settings.keyPoints !== false;
+        const n = on ? state.kp.points.length : 0;
+        kpBtn.hidden = !on;
+        kpBadge.textContent = String(n);
+        kpBadge.hidden = !n;
+        if (!on) { hideKpCue(); hideKpTip(); if (!kpView.hidden && ui.isOpen()) backFromHistory(); }
+        if (!kpView.hidden) renderKeypoints();
+        kpRenderMarkers();
+      },
       syncHistory() {
         const n = state.hist.nodes.length;
         histBadge.textContent = String(n);
@@ -1944,9 +2664,10 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
         if (!askWrap.hidden) {
           histChip.hidden = !n;
           histChip.querySelector('b').textContent = String(n);
-          askHint.hidden = askNoSub.hidden && histChip.hidden;
+          askHint.hidden = askNoSub.hidden && histChip.hidden && kpChip.hidden;
         }
         if (!histView.hidden) renderHistory();
+        if (!kpView.hidden) renderKeypoints(); // 「求助过」标记跟着历史节点变
       },
       appendTurn: turnView,
       showTip(m) { tip.textContent = m; tip.hidden = false; },
@@ -2011,6 +2732,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
     if (state.hist.videoId !== state.subs.videoId) loadHistory(state.subs.videoId); // 换了视频 / 分P
     trackGuide();
     checkPendingRestore();
+    kpTick();
   };
   tick();
   setInterval(tick, 1000);

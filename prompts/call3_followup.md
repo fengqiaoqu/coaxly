@@ -2,7 +2,7 @@
 Call 3 · 追问续接（规格第 5 节），流式输出。
 占位符：{{original_concept}} {{mode_label}} {{mode_rules}} {{call2_output}}
         {{follow_up}} {{history_summary}} {{transcript}}
-v1.3 分层记忆（探索）：{{global_layer}} {{section_layer}} {{recall_layer}} {{focus_before}} {{focus_after}}
+v1.4 整片记忆：{{global_layer}} {{section_layer}} {{recall_layer}} {{focus_before}} {{focus_after}}
   追问时回溯层除了“焦点里的术语前面在哪出现过”，还会按这句追问检索焦点之外最相关的一段。
 {{mode_label}} / {{mode_rules}} 来自 call3_mode_direct.md 或 call3_mode_socratic.md。
 -->

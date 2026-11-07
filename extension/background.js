@@ -4,7 +4,6 @@
  * 3. 截图：captureVisibleTab → OffscreenCanvas 裁出视频矩形（绕开 B 站跨域视频污染画布的问题）
  * 4. 历史节点（v1.2）：所有标签页的节点都由这里统一写入 chrome.storage.local，会话结束后调 /summarize 生成一句话说明。
  *    放在后台做，页面关掉了说明也照样会生成。
- * 5. 整片字幕（v1.3 探索）：内容脚本取 B 站字幕 JSON 被跨域拦下时，由这里代取（只放行 bilibili.com / hdslb.com）。
  */
 'use strict';
 
@@ -45,23 +44,6 @@ async function callProxy(path, body, method) {
     return { ok: false, status: res.status, error: (data && (data.error || data.message)) || text || `HTTP ${res.status}` };
   }
   return { ok: true, data };
-}
-
-// ------------------------------------------------------------------ 整片字幕（v1.3 探索）
-// 内容脚本取 B 站接口 / 字幕文件被跨域拦下时的后备。只放行 B 站自己的域名，不做通用代理。
-async function fetchBiliJson(url) {
-  let u;
-  try { u = new URL(url); } catch (_) { return { ok: false, error: 'bad_url' }; }
-  const host = u.hostname.toLowerCase();
-  const allowed = u.protocol === 'https:' && ['bilibili.com', 'hdslb.com'].some((d) => host === d || host.endsWith('.' + d));
-  if (!allowed) return { ok: false, error: 'host_not_allowed' };
-  try {
-    const res = await fetch(u.href, { credentials: 'include' });
-    if (!res.ok) return { ok: false, status: res.status, error: `HTTP ${res.status}` };
-    return { ok: true, data: await res.json() };
-  } catch (e) {
-    return { ok: false, error: String((e && e.message) || e) };
-  }
 }
 
 // ------------------------------------------------------------------ 截图并裁剪
@@ -108,7 +90,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return sendResponse(await captureFrame(sender.tab, msg.rect, msg.viewport));
       }
       if (msg.type === 'openOptions') { chrome.runtime.openOptionsPage(); return sendResponse({ ok: true }); }
-      if (msg.type === 'fetchJson') return sendResponse(await fetchBiliJson(msg.url));
       if (msg.type === 'hist:list') {
         sendResponse({ ok: true, data: await LBHistory.list(msg.videoId) });
         const settings = await getSettings();
