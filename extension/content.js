@@ -44,6 +44,7 @@
     session: null,
     explaining: false,
     subs: { videoId: null, entries: [], last: '' },
+    full: { videoId: null, status: 'idle', cues: [], tries: 0, at: 0, liveSent: 0, memory: null }, // v1.3 整片字幕
     lastDomSubAt: 0,
     frameTainted: false,
     hist: { videoId: null, nodes: [] },                       // 本视频的历史节点（缓存，以后台存储为准）
@@ -211,6 +212,9 @@
   function ensureSubsForVideo() {
     const id = getVideoId();
     if (state.subs.videoId !== id) state.subs = { videoId: id, entries: [], last: '' };
+    const f = state.full;
+    if (f.videoId !== id) loadFullSubs(id, 1);
+    else if (f.status === 'error' && f.tries < 3 && Date.now() - f.at > 60e3) loadFullSubs(id, f.tries + 1);
   }
 
   function observePlayer(v) {
@@ -257,6 +261,13 @@
   }
 
   function transcriptWindow(t) {
+    const f = state.full;
+    if (f.status === 'ok' && f.videoId === state.subs.videoId) {
+      // 有整片字幕：直接切 ±30 秒，暂停点之后的半分钟也有（边播边记只有播过的）
+      return f.cues
+        .filter((c) => c.to >= t - WINDOW_SEC && c.from <= t + WINDOW_SEC)
+        .map((c) => ({ t: c.from, text: c.text, src: 'full' }));
+    }
     const lastSeen = new Map();
     return state.subs.entries
       .filter((e) => e.t >= t - WINDOW_SEC && e.t <= t + WINDOW_SEC)
@@ -266,6 +277,142 @@
         lastSeen.set(e.text, e.t);
         return prev === undefined || e.t - prev > 4; // 倒回去重看时同一句会被记两次
       });
+  }
+
+  // ------------------------------------------------------------------ 整片字幕 → 分层记忆（v1.3 探索）
+  // 边播边记只有「播过的」字幕：暂停点后 30 秒没有，整部视频讲了什么也不知道。
+  // B 站的 CC / AI 字幕其实是一整份 JSON，可以一次拿全：
+  //   x/web-interface/view?bvid → aid、本分P的 cid → x/player/wbi/v2?aid&cid → subtitle_url → body[{from,to,content}]
+  // 拿到后：① 焦点窗口直接从整片字幕切，暂停点之后的半分钟也有；
+  //         ② 发给本地代理 /memory/build，后台生成分层记忆（小节摘要 + 全片大纲），
+  //            之后每次求助，代理按 t_sec 把「全局层 / 章节层 / 焦点层 / 回溯层」拼进提示词。
+  // 拿不到（没字幕 / AI 字幕要登录 / 番剧页）就退回边播边记；播过的字幕够多时也发一份 live 版本给代理。
+  const FULL_LIVE_MIN = 30;  // 边播边记至少 30 句才值得做记忆
+  const FULL_LIVE_STEP = 40; // 之后每多 40 句重发一次（代理只重做原文变了的小节）
+
+  function parseBiliId() {
+    const u = new URL(location.href);
+    const m = u.pathname.match(/\/video\/(BV[0-9A-Za-z]+|av\d+)/i);
+    if (!m) return null;
+    const p = Math.max(1, parseInt(u.searchParams.get('p') || '1', 10) || 1);
+    return /^av/i.test(m[1]) ? { aid: m[1].slice(2), p } : { bvid: m[1], p };
+  }
+
+  // 内容脚本直接取（带 B 站登录态，AI 字幕要登录）；被跨域拦了再交给后台取
+  async function getJson(url, withCookies) {
+    try {
+      const r = await fetch(url, { credentials: withCookies ? 'include' : 'omit' });
+      if (r.ok) return await r.json();
+    } catch (_) { /* 交给后台 */ }
+    const res = await bg({ type: 'fetchJson', url });
+    return res && res.ok ? res.data : null;
+  }
+
+  // 优先人工 CC 中文，其次 AI 中文
+  function pickSubtitle(list) {
+    const lan = (s) => String(s.lan || '').toLowerCase();
+    return list.find((s) => /^zh/.test(lan(s)))
+      || list.find((s) => /^ai-zh/.test(lan(s)))
+      || list.find((s) => /中文|汉语/.test(s.lan_doc || ''))
+      || list[0] || null;
+  }
+
+  async function fetchBiliSubtitles() {
+    const dev = document.getElementById('lb-dev-fullsubs'); // 开发自测页（dev/test-page.html?full=1）注入的整片字幕
+    if (dev) {
+      try {
+        const d = JSON.parse(dev.textContent);
+        return { status: 'ok', lan: d.lan || 'zh-CN', body: d.body || [], desc: d.desc || '', duration: d.duration || 0 };
+      } catch (_) { return { status: 'error', reason: 'dev_json' }; }
+    }
+    const id = parseBiliId();
+    if (!id) return { status: 'unsupported' };
+    const view = await getJson('https://api.bilibili.com/x/web-interface/view?' + (id.bvid ? 'bvid=' + id.bvid : 'aid=' + id.aid), true);
+    const vd = view && view.code === 0 && view.data;
+    if (!vd) return { status: 'error', reason: 'view' };
+    const pages = vd.pages || [];
+    const page = pages.find((x) => x.page === id.p) || pages[id.p - 1] || null;
+    const cid = page ? page.cid : vd.cid;
+    const meta = { desc: clip(vd.desc || '', 300), duration: (page && page.duration) || vd.duration || 0 };
+    let sub = null;
+    let needLogin = false;
+    for (const ep of ['x/player/wbi/v2', 'x/player/v2']) {
+      const pl = await getJson(`https://api.bilibili.com/${ep}?aid=${vd.aid}&cid=${cid}`, true);
+      const pd = pl && pl.code === 0 && pl.data;
+      if (!pd || (pd.cid && String(pd.cid) !== String(cid))) continue; // 偶尔会串到别的视频的字幕
+      if (pd.need_login_subtitle) needLogin = true;
+      const list = ((pd.subtitle && pd.subtitle.subtitles) || []).filter((s) => s && s.subtitle_url);
+      if (list.length) { sub = pickSubtitle(list); break; }
+    }
+    if (!sub) return { status: needLogin ? 'need_login' : 'none', ...meta };
+    const url = sub.subtitle_url.startsWith('//') ? 'https:' + sub.subtitle_url : sub.subtitle_url.replace(/^http:/, 'https:');
+    const file = await getJson(url, false);
+    const body = file && Array.isArray(file.body) ? file.body : null;
+    if (!body || !body.length) return { status: 'error', reason: 'subtitle_file', ...meta };
+    return { status: 'ok', lan: sub.lan || '', body, ...meta };
+  }
+
+  async function loadFullSubs(id, tries) {
+    const f = { videoId: id, status: 'loading', cues: [], lan: '', desc: '', duration: 0, tries, at: Date.now(), liveSent: 0, memory: null };
+    state.full = f;
+    let r;
+    try { r = await fetchBiliSubtitles(); } catch (e) { r = { status: 'error', reason: String((e && e.message) || e) }; }
+    if (state.full !== f) return; // 期间换了视频 / 分P
+    f.status = r.status;
+    f.at = Date.now();
+    f.desc = r.desc || '';
+    f.duration = r.duration || 0;
+    if (r.status === 'ok') {
+      f.lan = r.lan;
+      f.cues = r.body
+        .map((c) => ({ from: +c.from || 0, to: +c.to || +c.from || 0, text: String(c.content || '').replace(/\s+/g, ' ').trim() }))
+        .filter((c) => c.text)
+        .sort((a, b) => a.from - b.from);
+      if (f.cues.length < 5) f.status = 'none';
+    }
+    logEvent({ type: 'client_event', event: 'full_subs', video_id: id, status: f.status, reason: r.reason || null, lan: f.lan || null, cues: f.cues.length, tries });
+    if (f.status === 'ok') buildMemory('full');
+  }
+
+  // 边播边记的字幕 → [开始, 结束, 文本]（结束时间取下一句出现的时刻）
+  function liveCues() {
+    const es = state.subs.entries.slice().sort((a, b) => a.t - b.t);
+    return es.map((e, i) => {
+      const next = es[i + 1];
+      const end = next && next.t - e.t < 10 ? next.t : e.t + 3;
+      return [+e.t.toFixed(2), +end.toFixed(2), e.text];
+    });
+  }
+
+  async function buildMemory(source) {
+    const f = state.full;
+    const id = state.subs.videoId;
+    if (!id || f.videoId !== id) return;
+    const cues = source === 'full' ? f.cues.map((c) => [+c.from.toFixed(2), +c.to.toFixed(2), c.text]) : liveCues();
+    if (source === 'live') f.liveSent = state.subs.entries.length;
+    const v = state.video;
+    const res = await callProxy('/memory/build', {
+      video_id: id,
+      subject: getSubject(),
+      desc: f.desc || '',
+      source: source === 'full' ? 'bilibili' : 'live',
+      lan: f.lan || '',
+      duration: f.duration || (v && Number.isFinite(v.duration) ? v.duration : 0),
+      cues,
+    });
+    if (state.full !== f) return;
+    if (res.ok && res.data) f.memory = res.data;
+    else if (res.status === 404) f.memory = { status: 'unsupported' }; // 老版本代理没有 /memory
+  }
+
+  // 拿不到整片字幕时：求助前把播过的字幕发给代理（够多、且比上次多了一截才发）
+  function maybeBuildLive() {
+    const f = state.full;
+    if (f.videoId !== state.subs.videoId || f.status === 'ok' || f.status === 'loading') return;
+    if (f.memory && f.memory.status === 'unsupported') return;
+    const n = state.subs.entries.length;
+    if (n < FULL_LIVE_MIN || (f.liveSent && n - f.liveSent < FULL_LIVE_STEP)) return;
+    return buildMemory('live'); // 代理只是切小节、起后台任务，很快返回；等它是为了这次求助就能用上
   }
 
   // ------------------------------------------------------------------ 字幕状态与指引（v1.2 建议 1）
@@ -362,6 +509,7 @@
     g.lastT = t;
     if (g.shown || g.played < SUB_GUIDE_AFTER_SEC || state.settings.subGuide === false) return;
     if (state.subs.entries.length || ui.isOpen()) return;
+    if (state.full.videoId === id && state.full.status === 'ok') return; // 已经拿到整片字幕，不用打开播放器字幕
     const st = subtitleState();
     if (st === 'on') return;
     g.shown = true;
@@ -706,11 +854,13 @@
     state.explaining = true;
     ui.renderLoading(s);
     const past = (await loadPast(s.videoId)).slice(-3).map((p) => ({ question: p.question, core: p.core }));
+    if (!s.restored) { try { await maybeBuildLive(); } catch (_) {} }
     const res = await callProxy('/explain', {
       session_id: s.id,
       video_id: s.videoId,
       subject: s.subject,
       timestamp: s.timestamp,
+      t_sec: s.t, // v1.3：代理按它从整片记忆里切焦点层、定位章节
       transcript: s.transcript,
       question: s.question,
       past,
@@ -730,6 +880,7 @@
     if (typeof d.transcript === 'string' && d.transcript.length >= s.transcript.length) s.transcript = d.transcript;
     if (typeof d.degraded === 'boolean') s.degraded = d.degraded;
     s.screenText = d.screen_text || '';
+    s.memory = d.memory || null;
     if (!s.originalConcept && s.transcript) {
       const lines = s.transcript.trim().split('\n');
       s.originalConcept = clip(lines[lines.length - 1].replace(/^\[\d{1,3}:\d{2}\]\s*/, ''), 40);
@@ -764,6 +915,7 @@
       video_id: s.videoId,
       subject: s.subject,
       timestamp: s.timestamp,
+      t_sec: s.t,
       transcript: s.transcript,
       original_concept: s.originalConcept,
       call2_output: s.call2.text,
@@ -1496,6 +1648,12 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
       if (d.retried) metaBits.push('已重试');
       metaBits.push(d.vision_used ? '看了画面' : d.ocr_used ? '读了画面文字' : '未用画面');
       if (s.subsFromScreen) metaBits.push('字幕取自画面');
+      const m = d.memory;
+      if (m && m.used) {
+        metaBits.push(m.status === 'ready' || m.status === 'partial'
+          ? `整片记忆${m.chapters ? ` · ${m.chapters} 章` : ''}${m.chapter ? `「${m.chapter}」` : ''}`
+          : m.status === 'building' ? '整片记忆生成中' : '整片字幕');
+      }
       if (d.total_ms) metaBits.push(`${(d.total_ms / 1000).toFixed(1)}s`);
       out.push(h('div', { class: 'meta' + (d.length_violation ? ' warn' : '') }, metaBits.join(' · ')));
       return out;

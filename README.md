@@ -48,6 +48,17 @@ CHANGELOG.md              版本记录
 - **设置页「学习历史」**：按视频列出所有节点，点节点会打开那个视频并直接回溯；可以一键清空。
 - 历史**只存在本机浏览器**（`chrome.storage.local`），每个视频最多 50 个节点，总量超过 8MB 时删最久没看的视频。
 
+## 整片记忆（v1.3 探索，未合并到 main）
+
+让 AI 读完整部视频的字幕再解释：既知道全片在讲什么、现在讲到哪一章，又能看清暂停点前后各 30 秒。方案见 [docs/v1.3-记忆分层-方案.md](docs/v1.3-记忆分层-方案.md)。
+
+- **字幕来源**：打开视频页时直接从 B 站接口取整份 CC / AI 字幕（AI 字幕要登录 B 站）。取不到时退回边播边记：求助前把已经播过的字幕交给代理。
+- **生成**：代理在后台把字幕切成 2–3 分钟一节，调模型给每节写标题和摘要（map），再汇总成主线、章节和术语表（reduce），存在 `data/memory/<视频>.json`。不阻塞求助，没配 Key 时只存原文。
+- **求助时**拼四层上下文：全局层（主线 + 章节大纲，标出“现在在这一章”）→ 章节层（前后小节摘要）→ 焦点层（暂停点 ±30 秒原文，▶ 标出暂停那句）→ 回溯层（术语第一次出现的地方、和问题最相关的别的段落）。
+- 抽屉底部的小字显示「整片记忆 · 4 章「当前章名」」或「整片记忆生成中」。
+- `config.json` 可选 `"memory": { "enabled": true, "chunkSec": 150, "chunkChars": 900, "focusBefore": 30, "focusAfter": 30, "parallel": 3 }`。
+- 只用模拟上游测过，真模型的效果还没验证。
+
 ## 语音追问（v1.2：本机识别）
 
 Chrome 自带的语音识别要连 Google，国内用不了。v1.2 起改成：扩展只负责录音（16kHz 单声道，本地判断说完），录音发给本地代理，用 **Windows 自带的离线中文语音识别**转成文字，再自动作为追问发出。**不联网、不花钱、录音不保存**。一句七八秒的话识别约 0.3–0.5 秒。
@@ -99,6 +110,8 @@ Chrome 自带的语音识别要连 Google，国内用不了。v1.2 起改成：�
 | `call3_followup.md` | Call 3 追问 |
 | `call3_mode_direct.md` / `call3_mode_socratic.md` | 两种追问模式：第一行是模式名，其余是规则 |
 | `call4_summary.md` | Call 4 历史节点的一句话说明（v1.2） |
+| `memory_map.md` | 整片记忆：每个小节的标题、摘要、术语（v1.3 探索） |
+| `memory_reduce.md` | 整片记忆：全片主线、章节、术语表（v1.3 探索） |
 
 - `{{subject}}` 这类占位符由代理填入，每个文件开头的 `<!-- -->` 注释里列了可用的占位符；注释本身不会发给模型。
 - 模型输出里的 Markdown（`**`、标题、列表、「第一段：」之类）会被代理清掉再计字数。
@@ -112,7 +125,8 @@ Chrome 自带的语音识别要连 Google，国内用不了。v1.2 起改成：�
 - `close`：`user_closed_without_followup`（看完解释没追问就关了，规格里最关键的指标）、`turns`、`open_ms`、`node_id`、`restored`（是不是回溯出来的会话）
 - `call4`：`node_id`、`summary`、`chars`、`total_ms`
 - `asr`：`engine_used`、`audio_sec`、`text`、`ok`、`error`、`total_ms`（不存音频）
-- `client_event`：`event` 是 `sub_guide`（字幕指引：在哪出现、点了什么、字幕状态）/ `voice`（语音结果：sent / filled / denied / no_speech / asr_error …）/ `history_open` / `history_restore`。字段说明见 [docs/v1.2-规格变更.md](docs/v1.2-规格变更.md) 第 8 节
+- `client_event`：`event` 是 `sub_guide`（字幕指引：在哪出现、点了什么、字幕状态）/ `voice`（语音结果：sent / filled / denied / no_speech / asr_error …）/ `history_open` / `history_restore`。字段说明见 [docs/v1.2-规格变更.md](docs/v1.2-规格变更.md) 第 8 节；v1.3 探索加了 `full_subs`（整片字幕拿没拿到、为什么）
+- `memory`（v1.3 探索）：整片记忆生成完一行，小节数、模型摘要数、章节数、调用次数、耗时；`call2` / `call3` 多 `t_sec`、`memory_status`、`memory_focus`、`memory_chapter`、`memory_layer_chars`、`recall_hits`
 
 统计「看完就关」的比例（在项目目录打开 PowerShell）：
 
@@ -173,6 +187,7 @@ python -m http.server 8790 --bind 127.0.0.1
 | `?mic=deny` | 模拟麦克风权限被拒 |
 | `?burn=1` | 字幕烧进画面，测硬字幕识别 |
 | `?fresh=1` | 清空模拟页保存的历史（历史存在 localStorage，刷新页面还在） |
+| `?full=1` | 换成约 8 分钟的样例课（`dev/sample-subtitles.json`），并当作从 B 站取到了整片字幕，测整片记忆（v1.3 探索）；`POST /memory/context` 能看某个时间点拼出来的四层上下文 |
 
 设置页自测：`http://localhost:8790/dev/options-page.html`（加 `?seed=1` 放入几个 B 站视频的示例节点），加载真实的 `options.html`，和模拟播放页共用历史，点节点会显示将要打开的链接和 `pendingRestore`。
 

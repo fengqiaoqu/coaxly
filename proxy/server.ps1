@@ -15,6 +15,9 @@
     POST /ocr       画面识字（本地 Windows OCR）
     POST /asr       语音识别（v1.2：默认 Windows 本机离线识别，可选云端 /audio/transcriptions）
     POST /summarize Call 4：历史节点的一句话说明（v1.2）
+    POST /memory/build    整片字幕 → 后台生成分层记忆（v1.3 探索，见 docs/v1.3-记忆分层-方案.md）
+    GET  /memory/status   ?video_id= 记忆生成进度
+    POST /memory/context  调试：看某个时间点实际拼进提示词的四层上下文
 #>
 param(
   [string]$ConfigPath = '',
@@ -468,6 +471,7 @@ function Invoke-Router($cfg, [hashtable]$vars, [hashtable]$meta) {
   $result = $null
   $err = $null
   $jsonMode = $null
+  if (-not $vars.ContainsKey('outline')) { $vars.outline = '（无）' }
   if (-not (Test-HasKey $cfg)) { $err = 'no_api_key' }
   else {
     $sys = Fill-Template (Read-Prompt 'call1_router.md') $vars
@@ -484,7 +488,8 @@ function Invoke-Router($cfg, [hashtable]$vars, [hashtable]$meta) {
     } else { $err = $r.error }
   }
   if (-not $result) {
-    $result = Get-FallbackRoute $vars.question $vars.transcript
+    # 有整片大纲时一起比对：问到视频别处讲过的内容也算 in_video
+    $result = Get-FallbackRoute $vars.question ($vars.transcript + "`n" + $vars.outline)
     $result.error = $err
   }
   $result.ms = $sw.ElapsedMilliseconds
@@ -502,6 +507,695 @@ function Invoke-Router($cfg, [hashtable]$vars, [hashtable]$meta) {
       total_ms      = $result.ms
     })
   return $result
+}
+
+# ---------------------------------------------------------------- 字幕记忆分层（v1.3 探索）
+# 目标：AI 读完整部视频的全部字幕，既能模糊把握整体方向，又能精确把握暂停点前后那一段。
+#
+# 生成（扩展拿到整片字幕后 POST /memory/build，后台异步完成，结果存 data/memory/<视频>.json）：
+#   L0 原文层 cues    整片字幕逐句（扩展从 B 站字幕接口拉取；拉不到时用播放中边看边抓的字幕）
+#   L1 小节层 chunks  按时间切成 2–4 分钟的小节；map：一次读一批小节原文，每节写 ≤60 字摘要 + 术语
+#   L2 全局层 global  reduce：读全部小节摘要，写主题 + 主线 + 3–10 个章节 + 关键术语表
+#
+# 使用（每次 /explain、/followup 按暂停点 t 现场拼装，越往下越精确）：
+#   全局层  整片大纲，标出「用户现在在这一章」——只用来校准方向
+#   章节层  上一 / 当前 / 下一小节的摘要——这一段从哪来、往哪去
+#   焦点层  t-30 ~ t+30 秒原文，▶ 标出暂停那一句，分「已听过 / 还没看到」——解释对象
+#   回溯层  焦点里的术语在前文第一次出现的原文；追问时再按问题检索最相关的小节
+#
+# 代理是单线程的，生成记忆要调几次模型（十几秒到一分钟），所以用异步 HttpClient 任务、
+# 由主循环每 250ms 轮询推进；生成期间 /explain、/followup 照常响应，缺的层写「还在生成」。
+$MemDir = Join-Path $DataDir 'memory'
+$MEM_VERSION     = 1
+$MEM_BATCH_CHARS = 6000   # map 一次最多读多少字
+$MEM_BATCH_MAX   = 8      # map 一次最多几个小节
+$script:MemCache = @{}    # video_id → 记忆对象（正在生成的也在这里，查询能看到进度）
+$script:MemJobs  = @{}    # video_id → 生成任务
+$script:MemIndex = @{}    # 记忆 hash → 小节二字词索引（追问检索用）
+
+function Get-MemSettings($cfg) {
+  $s = @{ enabled = $true; chunkSec = 150; chunkChars = 900; focusBefore = 30; focusAfter = 30; parallel = 3 }
+  $m = $cfg.memory
+  if ($m) { foreach ($k in @($s.Keys)) { $v = Get-Field $m $k $null; if ($null -ne $v) { $s[$k] = $v } } }
+  $s.enabled = ($s.enabled -ne $false)
+  foreach ($k in @('chunkSec', 'chunkChars', 'focusBefore', 'focusAfter', 'parallel')) { $s[$k] = [Math]::Max(1, [double]$s[$k]) }
+  return $s
+}
+
+function Format-Clock($sec) {
+  $s = [Math]::Max(0, [int][Math]::Floor([double]$sec))
+  return ('{0:00}:{1:00}' -f [int][Math]::Floor($s / 60), ($s % 60))
+}
+
+function Get-ShortHash([string]$s) {
+  $sha = [Security.Cryptography.SHA1]::Create()
+  try { $b = $sha.ComputeHash($Utf8.GetBytes($s)) } finally { $sha.Dispose() }
+  return (-join ($b[0..7] | ForEach-Object { $_.ToString('x2') }))
+}
+
+function Get-MemPath([string]$videoId) {
+  $safe = [regex]::Replace($videoId, '[^A-Za-z0-9_\-]', '_')
+  if ($safe.Length -gt 80) { $safe = $safe.Substring(0, 60) + '_' + (Get-ShortHash $videoId) }
+  return (Join-Path $MemDir ($safe + '.json'))
+}
+
+# 接受 [[from, to, text], ...]（扩展发的紧凑格式）或 B 站原始格式 [{from, to, content}]
+function ConvertTo-MemCues($raw) {
+  $list = New-Object System.Collections.ArrayList
+  foreach ($c in @($raw)) {
+    if ($null -eq $c) { continue }
+    if ($c -is [System.Collections.IList]) {
+      if ($c.Count -lt 3) { continue }
+      $s = [double]$c[0]; $e = [double]$c[1]; $text = [string]$c[2]
+    } else {
+      $s = [double](Get-Field $c 'from' (Get-Field $c 's' 0))
+      $e = [double](Get-Field $c 'to' (Get-Field $c 'e' $s))
+      $text = [string](Get-Field $c 'content' (Get-Field $c 'text' ''))
+    }
+    $text = ($text -replace '\s+', ' ').Trim()
+    if (-not $text) { continue }
+    if ($e -lt $s) { $e = $s }
+    [void]$list.Add([ordered]@{ s = [Math]::Round($s, 2); e = [Math]::Round($e, 2); text = $text })
+  }
+  $out = New-Object System.Collections.ArrayList
+  foreach ($c in @($list | Sort-Object { $_.s })) {
+    if ($out.Count) {
+      $p = $out[$out.Count - 1]
+      if ($p.text -eq $c.text -and $c.s - $p.s -lt 6) { if ($c.e -gt $p.e) { $p.e = $c.e }; continue } # 倒回重看时抓到两遍
+    }
+    [void]$out.Add($c)
+  }
+  return , $out.ToArray()
+}
+
+# 小节原文：每隔 30 秒插一个 [mm:ss]，让模型知道大概的时间位置，又不至于每句都带时间戳浪费字数
+function Get-ChunkText($cues, [int]$a, [int]$b) {
+  $sb = New-Object System.Text.StringBuilder
+  $nextMark = -1.0
+  for ($i = $a; $i -le $b; $i++) {
+    $c = $cues[$i]
+    if ([double]$c.s -ge $nextMark) {
+      if ($sb.Length) { [void]$sb.Append("`n") }
+      [void]$sb.Append('[' + (Format-Clock $c.s) + '] ')
+      $nextMark = [double]$c.s + 30
+    } else { [void]$sb.Append(' ') }
+    [void]$sb.Append($c.text)
+  }
+  return $sb.ToString()
+}
+
+function Get-ChunkPlain($cues, [int]$a, [int]$b) {
+  $parts = for ($i = $a; $i -le $b; $i++) { $cues[$i].text }
+  return (@($parts) -join ' ')
+}
+
+# 切小节：到了目标时长 / 字数，就在下一个停顿或句末切开；最长不超过目标的 1.6 倍
+function Split-MemChunks($cues, $ms) {
+  $n = $cues.Count
+  $ranges = New-Object System.Collections.ArrayList
+  $a = 0
+  while ($a -lt $n) {
+    $s0 = [double]$cues[$a].s
+    $chars = 0
+    $b = $a
+    for ($i = $a; $i -lt $n; $i++) {
+      $b = $i
+      $chars += $cues[$i].text.Length
+      if ($i + 1 -ge $n) { break }
+      $dur = [double]$cues[$i].e - $s0
+      $gap = [double]$cues[$i + 1].s - [double]$cues[$i].e
+      $hard = ($dur -ge $ms.chunkSec * 1.6 -or $chars -ge $ms.chunkChars * 1.6)
+      $soft = (($dur -ge $ms.chunkSec -or $chars -ge $ms.chunkChars) -and ($gap -ge 0.6 -or $cues[$i].text -match '[。！？!?；;]$'))
+      if ($hard -or $soft) { break }
+    }
+    [void]$ranges.Add(@{ a = $a; b = $b })
+    $a = $b + 1
+  }
+  if ($ranges.Count -ge 2) {
+    $last = $ranges[$ranges.Count - 1]
+    $chars = (Get-ChunkPlain $cues $last.a $last.b).Length
+    if ([double]$cues[$last.b].e - [double]$cues[$last.a].s -lt $ms.chunkSec * 0.4 -and $chars -lt $ms.chunkChars * 0.4) {
+      $ranges[$ranges.Count - 2].b = $last.b
+      $ranges.RemoveAt($ranges.Count - 1)
+    }
+  }
+  $out = New-Object System.Collections.ArrayList
+  foreach ($r in $ranges) {
+    $plain = Get-ChunkPlain $cues $r.a $r.b
+    [void]$out.Add([ordered]@{
+        i       = $out.Count
+        s       = [double]$cues[$r.a].s
+        e       = [double]$cues[$r.b].e
+        a       = $r.a
+        b       = $r.b
+        hash    = Get-ShortHash $plain
+        title   = Limit-Text $cues[$r.a].text 12   # 规则兜底：模型摘要出来之前先用原文开头
+        summary = Limit-Text $plain 60
+        terms   = @()
+        src     = 'rule'
+      })
+  }
+  return , $out.ToArray()
+}
+
+function Get-CuesHash($cues, $ms) {
+  $sb = New-Object System.Text.StringBuilder
+  foreach ($c in $cues) { [void]$sb.Append([int]$c.s).Append('|').Append($c.text).Append("`n") }
+  [void]$sb.Append("chunk=$($ms.chunkSec)/$($ms.chunkChars)")
+  return (Get-ShortHash $sb.ToString())
+}
+
+function Save-Memory($mem) {
+  if (-not (Test-Path $MemDir)) { New-Item -ItemType Directory -Path $MemDir | Out-Null }
+  $mem.updated = (Get-Date).ToString('s')
+  [IO.File]::WriteAllText((Get-MemPath ([string]$mem.video_id)), (ConvertTo-Json -InputObject $mem -Depth 8 -Compress), $Utf8)
+}
+
+function Get-Memory([string]$videoId) {
+  if (-not $videoId) { return $null }
+  if ($script:MemCache.ContainsKey($videoId)) { return $script:MemCache[$videoId] }
+  $p = Get-MemPath $videoId
+  if (-not (Test-Path $p)) { return $null }
+  try { $m = [IO.File]::ReadAllText($p, $Utf8) | ConvertFrom-Json } catch { return $null }
+  if ([int](Get-Field $m 'version' 0) -ne $MEM_VERSION) { return $null }
+  if ($m.status -eq 'building') { $m.status = 'partial' } # 上次没生成完代理就关了
+  $script:MemCache[$videoId] = $m
+  return $m
+}
+
+# ---------------- 异步调用上游（不阻塞主循环）
+function Start-ChatTask($cfg, [string]$system, [string]$user, [double]$temperature, [int]$maxTokens, [bool]$jsonMode) {
+  $payload = [ordered]@{
+    model       = [string]$cfg.model
+    messages    = @(
+      [ordered]@{ role = 'system'; content = $system },
+      [ordered]@{ role = 'user'; content = $user }
+    )
+    temperature = $temperature
+    max_tokens  = $maxTokens
+    stream      = $false
+  }
+  if ($jsonMode) { $payload.response_format = @{ type = 'json_object' } }
+  # 读整片字幕比即时解释慢得多，超时单独放宽
+  $client = Get-HttpClient @{ httpProxy = [string]$cfg.httpProxy; timeoutSec = [Math]::Max(180, [int]$cfg.timeoutSec) }
+  # 先算好 URL：New-Object X(a, b + c) 里逗号比加号优先，会变成三个参数
+  $url = ([string]$cfg.baseUrl).TrimEnd('/') + '/chat/completions'
+  $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $url)
+  [void]$req.Headers.TryAddWithoutValidation('Authorization', 'Bearer ' + ([string]$cfg.apiKey).Trim())
+  $req.Content = New-Object System.Net.Http.StringContent((ConvertTo-Json -InputObject $payload -Depth 10 -Compress), $Utf8, 'application/json')
+  return @{ task = $client.SendAsync($req); req = $req; sw = [Diagnostics.Stopwatch]::StartNew() }
+}
+
+function Complete-ChatTask($ct) {
+  $task = $ct.task
+  try {
+    if ($task.IsCanceled) { return @{ ok = $false; status = 0; error = '上游超时' } }
+    if ($task.IsFaulted) {
+      $e = $task.Exception
+      while ($e.InnerException) { $e = $e.InnerException }
+      if ($e.GetType().Name -like '*Canceled*') { return @{ ok = $false; status = 0; error = '上游超时' } }
+      return @{ ok = $false; status = 0; error = '请求上游失败：' + $e.Message }
+    }
+    $resp = $task.Result
+    try {
+      $code = [int]$resp.StatusCode
+      $raw = $Utf8.GetString($resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult())
+    } finally { $resp.Dispose() }
+    if ($code -lt 200 -or $code -ge 300) { return @{ ok = $false; status = $code; error = "上游返回 HTTP ${code}：" + (Limit-Text $raw 300) } }
+    try { $obj = $raw | ConvertFrom-Json } catch { return @{ ok = $false; status = 200; error = '上游返回的不是 JSON：' + (Limit-Text $raw 200) } }
+    $text = $null
+    try { $text = [string]$obj.choices[0].message.content } catch {}
+    if (-not $text) { return @{ ok = $false; status = 200; error = '上游没有返回内容：' + (Limit-Text $raw 200) } }
+    return @{ ok = $true; status = 200; text = $text; ms = $ct.sw.ElapsedMilliseconds }
+  } finally {
+    try { $ct.req.Dispose() } catch {}
+  }
+}
+
+function ConvertFrom-LooseJson([string]$text) {
+  $t = [regex]::Replace([string]$text, '<think>[\s\S]*?</think>', '')
+  $t = [regex]::Replace($t, '```(?:json)?', '', 'IgnoreCase').Trim()
+  foreach ($pat in @('^[\s\S]*$', '\{[\s\S]*\}', '\[[\s\S]*\]')) {
+    $m = [regex]::Match($t, $pat)
+    if (-not $m.Success) { continue }
+    try { return ($m.Value | ConvertFrom-Json) } catch {}
+  }
+  return $null
+}
+
+# ---------------- 生成：map（小节摘要）→ reduce（全局）
+function Get-MapBatches($mem) {
+  $batches = New-Object System.Collections.ArrayList
+  $cur = New-Object System.Collections.ArrayList
+  $chars = 0
+  foreach ($c in @($mem.chunks)) {
+    if ($c.src -eq 'llm') { continue } # 原文没变的小节沿用上次的摘要
+    $len = (Get-ChunkText $mem.cues $c.a $c.b).Length
+    if ($cur.Count -and ($chars + $len -gt $MEM_BATCH_CHARS -or $cur.Count -ge $MEM_BATCH_MAX)) {
+      [void]$batches.Add(@{ ids = $cur.ToArray(); tries = 0 })
+      $cur = New-Object System.Collections.ArrayList
+      $chars = 0
+    }
+    [void]$cur.Add([int]$c.i)
+    $chars += $len
+  }
+  if ($cur.Count) { [void]$batches.Add(@{ ids = $cur.ToArray(); tries = 0 }) }
+  return , $batches
+}
+
+function Format-ChunkDigest($mem) {
+  $lines = foreach ($c in @($mem.chunks)) {
+    $head = "[$($c.i)] [$(Format-Clock $c.s)-$(Format-Clock $c.e)] "
+    if ($c.src -eq 'llm') {
+      $line = $head + $c.title + '：' + $c.summary
+      if (@($c.terms).Count) { $line += '（术语：' + (@($c.terms) -join '、') + '）' }
+      $line
+    } else { $head + '（这一节没有摘要，原文开头）' + $c.summary }
+  }
+  return (@($lines) -join "`n")
+}
+
+function Start-MemCall($job, [string]$kind, $batch) {
+  $mem = $job.mem
+  $vars = @{
+    subject     = [string]$mem.subject
+    desc        = $(if ([string]$mem.desc) { [string]$mem.desc } else { '（无）' })
+    duration    = Format-Clock $mem.duration
+    chunk_count = [string]@($mem.chunks).Count
+  }
+  if ($kind -eq 'map') {
+    $sys = Fill-Template (Read-Prompt 'memory_map.md') $vars
+    $parts = foreach ($id in $batch.ids) {
+      $c = $mem.chunks[$id]
+      "### 小节 $id [$(Format-Clock $c.s)-$(Format-Clock $c.e)]`n" + (Get-ChunkText $mem.cues $c.a $c.b)
+    }
+    $user = @($parts) -join "`n`n"
+    $max = 200 + 260 * @($batch.ids).Count
+  } else {
+    $sys = Fill-Template (Read-Prompt 'memory_reduce.md') $vars
+    $user = Format-ChunkDigest $mem
+    $max = 2000
+  }
+  $json = -not $job.noJson
+  $ct = Start-ChatTask $job.cfg $sys $user 0.2 $max $json
+  [void]$job.running.Add(@{ kind = $kind; batch = $batch; ct = $ct; json = $json })
+  $job.calls = $job.calls + 1
+}
+
+function Set-MapResult($mem, $ids, $obj) {
+  if ($null -eq $obj) { return 0 }
+  $items = if ($obj -is [System.Array]) { $obj } else { @(Get-Field $obj 'chunks' @()) }
+  $applied = 0
+  foreach ($it in @($items)) {
+    try { $i = [int](Get-Field $it 'i' -1) } catch { continue }
+    if (@($ids) -notcontains $i) { continue }
+    $summary = ([string](Get-Field $it 'summary' '')).Trim()
+    if (-not $summary) { continue }
+    $title = ([string](Get-Field $it 'title' '')).Trim()
+    $terms = @(@(Get-Field $it 'terms' @()) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -and $_.Length -le 16 } | Select-Object -First 6)
+    $c = $mem.chunks[$i]
+    if ($title) { $c.title = Limit-Text $title 16 }
+    $c.summary = Limit-Text $summary 90
+    $c.terms = $terms
+    $c.src = 'llm'
+    $applied++
+  }
+  return $applied
+}
+
+function Set-ReduceResult($mem, $obj) {
+  if ($null -eq $obj -or $obj -is [System.Array]) { return $false }
+  $chunks = @($mem.chunks)
+  $n = $chunks.Count
+  $topic = ([string](Get-Field $obj 'topic' '')).Trim()
+  $summary = ([string](Get-Field $obj 'summary' '')).Trim()
+  if (-not $summary -and -not $topic) { return $false }
+  # 章节：按 from 排序、去重叠、补空隙，保证按顺序覆盖全部小节
+  $raw = New-Object System.Collections.ArrayList
+  foreach ($ch in @(Get-Field $obj 'chapters' @())) {
+    try { $f = [int](Get-Field $ch 'from' -1); $t = [int](Get-Field $ch 'to' -1) } catch { continue }
+    if ($f -lt 0 -or $f -ge $n) { continue }
+    if ($t -lt $f) { $t = $f }
+    if ($t -ge $n) { $t = $n - 1 }
+    $title = ([string](Get-Field $ch 'title' '')).Trim()
+    [void]$raw.Add(@{ from = $f; to = $t; title = $title })
+  }
+  $chapters = New-Object System.Collections.ArrayList
+  $next = 0
+  foreach ($ch in @($raw | Sort-Object { $_.from })) {
+    if ($ch.to -lt $next) { continue }
+    $title = if ($ch.title) { Limit-Text $ch.title 18 } else { [string]$chunks[$next].title }
+    [void]$chapters.Add([ordered]@{ from = $next; to = $ch.to; title = $title; s = [double]$chunks[$next].s; e = [double]$chunks[$ch.to].e })
+    $next = $ch.to + 1
+  }
+  if ($next -lt $n) {
+    if ($chapters.Count) { $last = $chapters[$chapters.Count - 1]; $last.to = $n - 1; $last.e = [double]$chunks[$n - 1].e }
+    else { [void]$chapters.Add([ordered]@{ from = 0; to = $n - 1; title = $(if ($topic) { Limit-Text $topic 18 } else { '全片' }); s = [double]$chunks[0].s; e = [double]$chunks[$n - 1].e }) }
+  }
+  $terms = New-Object System.Collections.ArrayList
+  $seen = @{}
+  foreach ($tm in @(Get-Field $obj 'terms' @())) {
+    $term = ([string](Get-Field $tm 'term' '')).Trim()
+    if (-not $term -or $term.Length -gt 16 -or $seen.ContainsKey($term)) { continue }
+    $seen[$term] = 1
+    $ci = -1
+    try { $ci = [int](Get-Field $tm 'chunk' -1) } catch {}
+    $def = ([string](Get-Field $tm 'def' '')).Trim()
+    [void]$terms.Add([ordered]@{ term = $term; def = (Limit-Text $def 30); chunk = $ci })
+    if ($terms.Count -ge 15) { break }
+  }
+  $mem.global = [ordered]@{ topic = (Limit-Text $topic 30); summary = (Limit-Text $summary 220); chapters = $chapters.ToArray(); terms = $terms.ToArray() }
+  return $true
+}
+
+function Start-MemoryJob($mem, $cfg) {
+  $queue = Get-MapBatches $mem
+  $job = @{
+    mem = $mem; cfg = $cfg; queue = $queue; running = (New-Object System.Collections.ArrayList)
+    phase = 'map'; total = $queue.Count; done = 0; failed = 0; calls = 0; reduceTries = 0; noJson = $false
+    parallel = [int](Get-MemSettings $cfg).parallel
+    errors = (New-Object System.Collections.ArrayList); sw = [Diagnostics.Stopwatch]::StartNew()
+  }
+  $mem.model = [string]$cfg.model
+  $mem.progress = [ordered]@{ phase = 'map'; done = 0; total = $queue.Count }
+  $script:MemJobs[[string]$mem.video_id] = $job
+}
+
+function Step-MemoryJob($job) {
+  $mem = $job.mem
+  foreach ($r in @($job.running)) {
+    if (-not $r.ct.task.IsCompleted) { continue }
+    $job.running.Remove($r)
+    $res = Complete-ChatTask $r.ct
+    if (-not $res.ok -and $r.json -and $res.status -ge 400 -and @(401, 403, 429) -notcontains $res.status) {
+      $job.noJson = $true # 上游不支持 JSON 模式：去掉 response_format 重发
+      Start-MemCall $job $r.kind $r.batch
+      continue
+    }
+    if (-not $res.ok -and @(401, 403) -contains $res.status) {
+      [void]$job.errors.Add($res.error) # Key 有问题，别的批次也不用试了
+      $job.queue.Clear()
+      $job.phase = 'done'
+      continue
+    }
+    if ($r.kind -eq 'map') {
+      $applied = 0
+      if ($res.ok) { $applied = Set-MapResult $mem $r.batch.ids (ConvertFrom-LooseJson $res.text) }
+      if ($applied -gt 0) { $job.done = $job.done + 1; continue }
+      $r.batch.tries = $r.batch.tries + 1
+      $err = if ($res.ok) { 'map 输出解析失败：' + (Limit-Text $res.text 120) } else { [string]$res.error }
+      if ($r.batch.tries -lt 2 -and $job.phase -eq 'map') { $job.queue.Insert(0, $r.batch) }
+      else { $job.done = $job.done + 1; $job.failed = $job.failed + 1; [void]$job.errors.Add($err) }
+    } else {
+      $ok = $false
+      if ($res.ok) { $ok = Set-ReduceResult $mem (ConvertFrom-LooseJson $res.text) }
+      if ($ok) { $job.phase = 'done'; continue }
+      $job.reduceTries = $job.reduceTries + 1
+      [void]$job.errors.Add($(if ($res.ok) { 'reduce 输出解析失败：' + (Limit-Text $res.text 120) } else { [string]$res.error }))
+      if ($job.reduceTries -lt 2) { Start-MemCall $job 'reduce' $null } else { $job.phase = 'done' }
+    }
+  }
+  if ($job.phase -eq 'map') {
+    while ($job.running.Count -lt $job.parallel -and $job.queue.Count -gt 0) {
+      $b = $job.queue[0]
+      $job.queue.RemoveAt(0)
+      Start-MemCall $job 'map' $b
+    }
+    if ($job.running.Count -eq 0 -and $job.queue.Count -eq 0) {
+      $job.phase = 'reduce'
+      Start-MemCall $job 'reduce' $null
+    }
+  }
+  $mem.progress = [ordered]@{ phase = $job.phase; done = $job.done; total = $job.total }
+  if ($job.phase -eq 'done' -and $job.running.Count -eq 0) { Complete-MemoryJob $job }
+}
+
+function Complete-MemoryJob($job) {
+  $mem = $job.mem
+  $vid = [string]$mem.video_id
+  if ([object]::ReferenceEquals($script:MemJobs[$vid], $job)) { $script:MemJobs.Remove($vid) }
+  $total = @($mem.chunks).Count
+  $llm = @($mem.chunks | Where-Object { $_.src -eq 'llm' }).Count
+  $mem.status = if ($mem.global -and $llm -eq $total) { 'ready' } elseif ($mem.global -or $llm -gt 0) { 'partial' } else { 'raw' }
+  $mem.error = if ($job.errors.Count) { Limit-Text ([string]$job.errors[0]) 300 } else { $null }
+  $mem.built_ms = $job.sw.ElapsedMilliseconds
+  $mem.progress = [ordered]@{ phase = 'done'; done = $job.done; total = $job.total }
+  Save-Memory $mem
+  $chapters = if ($mem.global) { @($mem.global.chapters).Count } else { 0 }
+  Write-CallLog ([ordered]@{
+      type         = 'memory'
+      video_id     = $vid
+      source       = $mem.source
+      status       = $mem.status
+      cues         = @($mem.cues).Count
+      chunks       = $total
+      chunks_llm   = $llm
+      chapters     = $chapters
+      calls        = $job.calls
+      failed       = $job.failed
+      model        = $mem.model
+      error        = $mem.error
+      total_ms     = $mem.built_ms
+    })
+  $color = if ($mem.status -eq 'ready') { 'Green' } else { 'DarkYellow' }
+  Write-Host ('[{0}] 整片记忆 {1}：{2} 句 → {3} 小节（模型摘要 {4}）→ {5} 章，调用 {6} 次，{7:0.0}s{8}' -f (Get-Date -Format 'HH:mm:ss'), $vid, @($mem.cues).Count, $total, $llm, $chapters, $job.calls, ($mem.built_ms / 1000), $(if ($mem.error) { '  ' + (Limit-Text $mem.error 80) } else { '' })) -ForegroundColor $color
+}
+
+# 主循环每 250ms、每处理完一个请求调一次；任何异常都只影响这一个任务，不影响代理
+function Step-MemoryJobs {
+  if ($script:MemJobs.Count -eq 0) { return }
+  foreach ($vid in @($script:MemJobs.Keys)) {
+    $job = $script:MemJobs[$vid]
+    try { Step-MemoryJob $job }
+    catch {
+      [void]$job.errors.Insert(0, '生成记忆时代理内部错误：' + $_.Exception.Message)
+      $job.running.Clear()
+      try { Complete-MemoryJob $job } catch { $script:MemJobs.Remove($vid) }
+    }
+  }
+}
+
+# ---------------- 使用：按暂停点拼装四层上下文
+function Get-Bigrams([string]$s) {
+  $set = New-Object 'System.Collections.Generic.HashSet[string]'
+  foreach ($m in [regex]::Matches(([string]$s).ToLowerInvariant(), '[一-鿿a-z0-9]+')) {
+    $v = $m.Value
+    for ($i = 0; $i -le $v.Length - 2; $i++) { [void]$set.Add($v.Substring($i, 2)) }
+  }
+  return , $set
+}
+
+function Get-MemIndex($mem) {
+  $key = [string]$mem.hash + '|' + [string]$mem.updated
+  if ($script:MemIndex.ContainsKey($key)) { return $script:MemIndex[$key] }
+  $sets = New-Object System.Collections.ArrayList
+  $df = New-Object 'System.Collections.Generic.Dictionary[string,int]'
+  foreach ($c in @($mem.chunks)) {
+    $set = Get-Bigrams ((Get-ChunkPlain $mem.cues $c.a $c.b) + ' ' + $c.title + ' ' + $c.summary)
+    [void]$sets.Add($set)
+    foreach ($g in $set) { if ($df.ContainsKey($g)) { $df[$g] = $df[$g] + 1 } else { $df[$g] = 1 } }
+  }
+  if ($script:MemIndex.Count -gt 20) { $script:MemIndex.Clear() }
+  $idx = @{ sets = $sets; df = $df; n = $sets.Count }
+  $script:MemIndex[$key] = $idx
+  return $idx
+}
+
+function Format-ChunkLine($c, [string]$label) {
+  $head = "$label [$(Format-Clock $c.s)-$(Format-Clock $c.e)] "
+  if ($c.src -ne 'llm') { return $head + '（摘要还没生成，原文开头）' + $c.summary }
+  $line = $head + $c.title + '：' + $c.summary
+  if (@($c.terms).Count) { $line += '（术语：' + (@($c.terms) -join '、') + '）' }
+  return $line
+}
+
+function Get-CueSnippet($cues, [int]$k) {
+  $a = [Math]::Max(0, $k - 1)
+  $b = [Math]::Min($cues.Count - 1, $k + 1)
+  return (Limit-Text (Get-ChunkPlain $cues $a $b) 90)
+}
+
+function Get-MemoryContext($mem, [double]$t, [string]$question, $ms) {
+  $cues = @($mem.cues)
+  $n = $cues.Count
+  $chunks = @($mem.chunks)
+  $g = $mem.global
+  $lo = $t - $ms.focusBefore
+  $hi = $t + $ms.focusAfter
+
+  # ---- 焦点层：t 前后原文，▶ 标出暂停那一句
+  $cur = -1
+  for ($i = 0; $i -lt $n; $i++) { if ([double]$cues[$i].s -le $t + 0.3) { $cur = $i } else { break } }
+  $pre = New-Object System.Collections.ArrayList
+  $post = New-Object System.Collections.ArrayList
+  $curLine = $null
+  $focusChars = 0
+  $focusText = New-Object System.Text.StringBuilder
+  $focusLo = $n
+  for ($i = 0; $i -lt $n; $i++) {
+    $c = $cues[$i]
+    if ([double]$c.e -lt $lo -and $i -ne $cur) { continue }
+    if ([double]$c.s -gt $hi) { break }
+    if ($i -lt $focusLo) { $focusLo = $i }
+    $line = '[' + (Format-Clock $c.s) + '] ' + $c.text
+    $focusChars += $c.text.Length
+    [void]$focusText.Append($c.text).Append(' ')
+    if ($i -lt $cur) { [void]$pre.Add($line) }
+    elseif ($i -eq $cur) { $curLine = '▶ ' + $line + '　← 用户在 ' + (Format-Clock $t) + ' 暂停，这是暂停时正在播（或刚播完）的一句' }
+    else { [void]$post.Add($line) }
+  }
+  $fl = New-Object System.Collections.ArrayList
+  if ($pre.Count) { [void]$fl.Add('（暂停前，用户刚听过）'); $fl.AddRange($pre) }
+  if ($curLine) { [void]$fl.Add($curLine) }
+  if ($post.Count) { [void]$fl.Add('（暂停后，用户还没看到）'); $fl.AddRange($post) }
+  $focus = @($fl) -join "`n"
+
+  # ---- 暂停点落在哪个小节 / 哪一章
+  $ci = 0
+  foreach ($c in $chunks) { if ([double]$c.s -le $t) { $ci = [int]$c.i } else { break } }
+  $curChapter = $null
+  $curChapterNo = 0
+
+  # ---- 全局层
+  $gl = New-Object System.Collections.ArrayList
+  $ol = New-Object System.Collections.ArrayList
+  if ($g) {
+    if ($g.topic) { [void]$gl.Add('主题：' + $g.topic) }
+    if ($g.summary) { [void]$gl.Add('主线：' + $g.summary) }
+    [void]$gl.Add('章节（全长 ' + (Format-Clock $mem.duration) + '）：')
+    $k = 0
+    foreach ($ch in @($g.chapters)) {
+      $k++
+      $line = "  $k. [$(Format-Clock $ch.s)-$(Format-Clock $ch.e)] $($ch.title)"
+      if ($ci -ge [int]$ch.from -and $ci -le [int]$ch.to) { $line += '　← 用户现在在这一章'; $curChapter = $ch; $curChapterNo = $k }
+      [void]$gl.Add($line)
+      [void]$ol.Add("[$(Format-Clock $ch.s)] $($ch.title)")
+    }
+    $terms = @(@($g.terms) | Where-Object { $_ -and $_.term } | Select-Object -First 12)
+    if ($terms.Count) { [void]$gl.Add('关键术语：' + ((@($terms | ForEach-Object { if ($_.def) { "$($_.term)（$($_.def)）" } else { [string]$_.term } })) -join '；')) }
+  } else {
+    $llm = @($chunks | Where-Object { $_.src -eq 'llm' })
+    if ($llm.Count) {
+      [void]$gl.Add('（整片总览还在生成，先给已读完的小节标题）')
+      foreach ($c in $llm) { [void]$gl.Add("  [$(Format-Clock $c.s)] $($c.title)"); [void]$ol.Add("[$(Format-Clock $c.s)] $($c.title)") }
+    } else {
+      [void]$gl.Add('（整片记忆还在生成，暂时只有暂停点附近的字幕）')
+    }
+  }
+
+  # ---- 章节层：上一 / 当前 / 下一小节
+  $sl = New-Object System.Collections.ArrayList
+  if ($chunks.Count) {
+    if ($curChapter) { [void]$sl.Add("所在章节：第 $curChapterNo 章「$($curChapter.title)」") }
+    if ($ci -gt 0) { [void]$sl.Add((Format-ChunkLine $chunks[$ci - 1] '上一小节')) }
+    [void]$sl.Add((Format-ChunkLine $chunks[$ci] '▶ 当前小节'))
+    if ($ci + 1 -lt $chunks.Count) { [void]$sl.Add((Format-ChunkLine $chunks[$ci + 1] '下一小节')) }
+  }
+
+  # ---- 回溯层 ①：焦点里出现的术语，在前文第一次出现的地方（老师常说「我们前面讲过的 X」）
+  $rl = New-Object System.Collections.ArrayList
+  $termDefs = [ordered]@{}
+  if ($g) { foreach ($tm in @($g.terms)) { if ($tm -and $tm.term -and -not $termDefs.Contains([string]$tm.term)) { $termDefs[[string]$tm.term] = [string]$tm.def } } }
+  foreach ($c in $chunks) { if ($c.src -eq 'llm') { foreach ($tm in @($c.terms)) { if ($tm -and -not $termDefs.Contains([string]$tm)) { $termDefs[[string]$tm] = '' } } } }
+  $probe = $focusText.ToString() + ' ' + $question
+  $usedCues = @{}
+  foreach ($term in @($termDefs.Keys | Sort-Object { -([string]$_).Length })) {
+    if ($rl.Count -ge 2) { break }
+    if ($term.Length -lt 2 -or $probe.IndexOf($term, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+    $first = -1
+    for ($k = 0; $k -lt $focusLo; $k++) { if ($cues[$k].text.IndexOf($term, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $first = $k; break } }
+    if ($first -lt 0 -or [double]$cues[$first].s -ge $lo - 5 -or $usedCues.ContainsKey($first)) { continue }
+    $usedCues[$first] = 1
+    $line = "- 「$term」最早在 [$(Format-Clock $cues[$first].s)] 出现：$(Get-CueSnippet $cues $first)"
+    if ($termDefs[$term]) { $line += "（术语表：$($termDefs[$term])）" }
+    [void]$rl.Add($line)
+  }
+
+  # ---- 回溯层 ②：追问时按问题检索焦点之外最相关的小节（二字词 + 逆文档频率）
+  if ($question -and $question -ne $T_DEFAULT_QUESTION -and $chunks.Count -ge 2) {
+    $idx = Get-MemIndex $mem
+    $qg = Get-Bigrams $question
+    $best = -1; $bestScore = 0.0; $bestHits = 0
+    for ($k = 0; $k -lt $chunks.Count; $k++) {
+      $c = $chunks[$k]
+      if ([double]$c.e -ge $lo -and [double]$c.s -le $hi) { continue } # 和焦点重叠的小节已经在上面了
+      $score = 0.0; $hits = 0
+      foreach ($q in $qg) {
+        if (-not $idx.sets[$k].Contains($q)) { continue }
+        $df = $idx.df[$q]
+        if ($df -ge $idx.n) { continue } # 每节都有的词没有区分度
+        $score += [Math]::Log(($idx.n + 1.0) / ($df + 0.5))
+        $hits++
+      }
+      if ($hits -ge 2 -and $score -gt $bestScore) { $best = $k; $bestScore = $score; $bestHits = $hits }
+    }
+    if ($best -ge 0) {
+      $c = $chunks[$best]
+      [void]$rl.Add('- 和这次追问最相关的另一段：' + (Format-ChunkLine $c ''))
+      $bk = -1; $bh = 0
+      for ($k = [int]$c.a; $k -le [int]$c.b; $k++) {
+        $h = 0
+        foreach ($q in $qg) { if ($cues[$k].text.ToLowerInvariant().Contains($q)) { $h++ } }
+        if ($h -gt $bh) { $bh = $h; $bk = $k }
+      }
+      if ($bk -ge 0) { [void]$rl.Add("  原文 [$(Format-Clock $cues[$bk].s)]：$(Get-CueSnippet $cues $bk)") }
+    }
+  }
+
+  return @{
+    used          = $true
+    status        = [string]$mem.status
+    source        = [string]$mem.source
+    focus         = $focus
+    focus_chars   = $focusChars
+    global_layer  = Limit-Text (@($gl) -join "`n") 1600
+    section_layer = $(if ($sl.Count) { Limit-Text (@($sl) -join "`n") 700 } else { '（无）' })
+    recall_layer  = $(if ($rl.Count) { Limit-Text (@($rl) -join "`n") 600 } else { '（无）' })
+    outline       = $(if ($ol.Count) { Limit-Text (@($ol) -join ' / ') 600 } else { '（无）' })
+    chunk_index   = $ci
+    chapter       = $(if ($curChapter) { [string]$curChapter.title } else { $null })
+    chapters      = $(if ($g) { @($g.chapters).Count } else { 0 })
+    recall_hits   = $rl.Count
+  }
+}
+
+# 给 /explain、/followup、/route 用：没有记忆时各层填说明文字，保证提示词里不留 {{占位符}}
+function Get-MemoryVars($cfg, [string]$videoId, $tSec, [string]$question, [string]$clientTranscript = '') {
+  $ms = Get-MemSettings $cfg
+  $empty = @{
+    used = $false; status = 'none'; focus = $null; focus_chars = 0; chapters = 0; recall_hits = 0
+    global_layer = '（没有整片字幕记忆，只拿到了暂停点附近的字幕）'; section_layer = '（无）'; recall_layer = '（无）'; outline = '（无）'
+    focus_before = [string][int]$ms.focusBefore; focus_after = [string][int]$ms.focusAfter
+  }
+  if (-not $ms.enabled -or -not $videoId -or $null -eq $tSec -or [string]$tSec -eq '') { return $empty }
+  try { $t = [double]$tSec } catch { return $empty }
+  $mem = Get-Memory $videoId
+  if (-not $mem -or @($mem.cues).Count -eq 0) { return $empty }
+  try {
+    $r = Get-MemoryContext $mem $t $question $ms
+    $r.focus_before = $empty.focus_before
+    $r.focus_after = $empty.focus_after
+    # 防串台：客户端自己抓到的字幕和记忆里同一时间段的字幕几乎不重合（同一个编号换了视频、
+    # 开发自测页不同课程共用一个编号……），就不用这份记忆，免得把别的视频的内容拼进提示词
+    if ($clientTranscript -and $r.focus_chars -ge 10) {
+      $cg = Get-Bigrams ([regex]::Replace($clientTranscript, '\[\d{1,3}:\d{2}\]', ''))
+      if ($cg.Count -ge 12) {
+        $fg = Get-Bigrams $r.focus
+        $hit = 0
+        foreach ($x in $cg) { if ($fg.Contains($x)) { $hit++ } }
+        if ($hit / $cg.Count -lt 0.3) {
+          Write-Host ('    整片记忆和这次的字幕对不上（重合 {0:P0}），这次不用记忆：{1}' -f ($hit / $cg.Count), $videoId) -ForegroundColor DarkYellow
+          $empty.status = 'mismatch'
+          return $empty
+        }
+      }
+    }
+    return $r
+  } catch {
+    Write-Host ('    拼装整片记忆失败：' + $_.Exception.Message) -ForegroundColor DarkYellow
+    $empty.status = 'error'
+    return $empty
+  }
 }
 
 # ---------------------------------------------------------------- HTTP 小工具
@@ -567,6 +1261,7 @@ function Invoke-Health($ctx) {
       asrReady    = $(if ($cfg.asrEngine -ne 'off') { [bool](Initialize-Asr).ok } else { $false })
       asrError    = $(if ($cfg.asrEngine -ne 'off') { (Initialize-Asr).error } else { $null })
       asrModel    = $(if ($cfg.asrEngine -eq 'cloud') { [string](Get-Field $cfg.asr 'model' '') } else { $null })
+      memory      = [ordered]@{ enabled = (Get-MemSettings $cfg).enabled; building = @($script:MemJobs.Keys) }
       prompts     = $files
     })
   return 'ok'
@@ -581,6 +1276,9 @@ function Invoke-RouteEndpoint($ctx, $body) {
     transcript = [string](Get-Field $body 'transcript' '')
     question   = Get-NonEmpty $body 'question' ''
   }
+  $mem = Get-MemoryVars $cfg ([string](Get-Field $body 'video_id' '')) (Get-Field $body 't_sec' $null) $vars.question $vars.transcript
+  $vars.outline = $mem.outline
+  if ($mem.focus -and $mem.focus_chars -ge (Get-TranscriptBodyLength $vars.transcript)) { $vars.transcript = $mem.focus }
   $meta = @{ session_id = (Get-Field $body 'session_id' $null); video_id = (Get-Field $body 'video_id' $null) }
   $r = Invoke-Router $cfg $vars $meta
   Send-Json $ctx 200 ([ordered]@{ route = $r.route; redirect = $r.redirect; fallback = [bool]$r.fallback; error = $r.error; total_ms = $r.ms })
@@ -625,23 +1323,37 @@ function Invoke-Explain($ctx, $body) {
   $image = [string](Get-Field $body 'image' '')
   $wantImage = ($image.StartsWith('data:image/') -and ($cfg.sendImage -ne $false))
 
+  # 整片记忆（v1.3）：有记忆时，焦点层从整片字幕里按暂停点重新截取——
+  # 包括用户还没播到的后 30 秒，并标出暂停那一句；另外拼上全局层、章节层、回溯层
+  $mem = Get-MemoryVars $cfg ([string](Get-Field $body 'video_id' '')) (Get-Field $body 't_sec' $null) $question $transcript
+  $useMemFocus = ($mem.used -and $mem.focus -and $mem.focus_chars -ge [Math]::Floor(0.8 * (Get-TranscriptBodyLength $transcript)))
+  $promptTranscript = if ($useMemFocus) { $mem.focus } else { $transcript }
+
   # 模型不看图时，用本地文字识别读出画面上的字（含烧在画面里的硬字幕）
   $frameText = $null
   if (-not $wantImage) { $frameText = Get-FrameText $cfg $image }
-  if ($frameText -and $frameText.ok) { $transcript = Add-SubtitleToTranscript $transcript $timestamp $frameText.subtitle }
+  if ($frameText -and $frameText.ok) {
+    $transcript = Add-SubtitleToTranscript $transcript $timestamp $frameText.subtitle
+    $promptTranscript = Add-SubtitleToTranscript $promptTranscript $timestamp $frameText.subtitle
+  }
   $screenText = Format-ScreenText $frameText
   $textQuestion = if ($screenText) { $question + "`n`n" + $screenText } else { $question }
 
-  $degraded = ((Get-TranscriptBodyLength $transcript) -lt 10)
+  $degraded = if ($useMemFocus) { ((Get-TranscriptBodyLength $transcript) -lt 10 -and $mem.focus_chars -lt 10) } else { ((Get-TranscriptBodyLength $promptTranscript) -lt 10) }
   $route = [string](Get-Field $body 'route' 'in_video')
   if ($ROUTES -notcontains $route) { $route = 'in_video' }
   $vars = @{
-    subject    = Get-NonEmpty $body 'subject' $T_UNKNOWN_SUBJECT
-    timestamp  = $timestamp
-    transcript = $transcript
-    question   = $question
-    past       = Format-Past (Get-Field $body 'past' $null)
-    route      = $route
+    subject       = Get-NonEmpty $body 'subject' $T_UNKNOWN_SUBJECT
+    timestamp     = $timestamp
+    transcript    = $promptTranscript
+    question      = $question
+    past          = Format-Past (Get-Field $body 'past' $null)
+    route         = $route
+    global_layer  = $mem.global_layer
+    section_layer = $mem.section_layer
+    recall_layer  = $mem.recall_layer
+    focus_before  = $mem.focus_before
+    focus_after   = $mem.focus_after
   }
   $promptFile = if ($degraded) { 'call2_degraded.md' } else { 'call2_explain.md' }
   $system = Fill-Template (Read-Prompt $promptFile) $vars
@@ -665,7 +1377,15 @@ function Invoke-Explain($ctx, $body) {
     ocr_subtitle       = if ($frameText) { $frameText.subtitle } else { $null }
     ocr_ms             = if ($frameText) { $frameText.ms } else { $null }
     ocr_error          = if ($frameText) { $frameText.error } else { $null }
+    t_sec              = Get-Field $body 't_sec' $null
+    memory_status      = $mem.status
+    memory_focus       = $useMemFocus
+    memory_chapter     = $mem.chapter
+    memory_layer_chars = [ordered]@{ global = $mem.global_layer.Length; section = $mem.section_layer.Length; focus = $promptTranscript.Length; recall = $mem.recall_layer.Length }
+    recall_hits        = $mem.recall_hits
   }
+  if ($useMemFocus) { $rec.prompt_transcript = $promptTranscript }
+  $memInfo = [ordered]@{ used = [bool]$mem.used; status = $mem.status; focus = $useMemFocus; chapters = $mem.chapters; chapter = $mem.chapter; recall_hits = $mem.recall_hits }
 
   if (-not (Test-HasKey $cfg)) {
     $rec.error = 'no_api_key'
@@ -739,12 +1459,14 @@ function Invoke-Explain($ctx, $body) {
       transcript       = $transcript
       route            = $route
       model            = $finalModel
+      memory           = $memInfo
       total_ms         = $sw.ElapsedMilliseconds
     })
   $flag = if ($violation) { ' 超长!' } else { '' }
   $deg = if ($degraded) { ' 降级' } else { '' }
   $ocrFlag = if (-not $screenText) { '' } elseif ($frameText) { " 画面文字=$($frameText.ms)ms" } else { ' 画面文字' }
-  return "call2 $($final.chars)字 段长[$(@($final.seg_lengths) -join ',')]$flag$deg 图=$visionUsed$ocrFlag 重试=$retried"
+  $memFlag = if ($mem.used) { " 记忆=$($mem.status)$(if ($mem.chapter) { '/' + $mem.chapter })$(if ($mem.recall_hits) { ' 回溯' + $mem.recall_hits })" } else { '' }
+  return "call2 $($final.chars)字 段长[$(@($final.seg_lengths) -join ',')]$flag$deg 图=$visionUsed$ocrFlag 重试=$retried$memFlag"
 }
 
 # ---------------------------------------------------------------- /followup（Call 3，流式）
@@ -755,7 +1477,11 @@ function Invoke-Followup($ctx, $body) {
   if (-not $followUp) { Send-Json $ctx 400 @{ error = 'follow_up 不能为空' }; return 'empty follow_up' }
 
   $transcript = [string](Get-Field $body 'transcript' '')
-  $degraded = ((Get-TranscriptBodyLength $transcript) -lt 10)
+  # 整片记忆（v1.3）：追问时回溯层额外按「这句追问」检索焦点之外最相关的小节
+  $mem = Get-MemoryVars $cfg ([string](Get-Field $body 'video_id' '')) (Get-Field $body 't_sec' $null) $followUp $transcript
+  $useMemFocus = ($mem.used -and $mem.focus -and $mem.focus_chars -ge [Math]::Floor(0.8 * (Get-TranscriptBodyLength $transcript)))
+  if ($useMemFocus) { $transcript = $mem.focus }
+  $degraded = if ($useMemFocus) { $mem.focus_chars -lt 10 } else { ((Get-TranscriptBodyLength $transcript) -lt 10) }
   $meta = @{ session_id = (Get-Field $body 'session_id' $null); video_id = (Get-Field $body 'video_id' $null) }
   $mode = if ([string](Get-Field $body 'mode' 'direct') -eq 'socratic') { 'socratic' } else { 'direct' }
   $timestamp = Get-NonEmpty $body 'timestamp' '00:00'
@@ -771,6 +1497,12 @@ function Invoke-Followup($ctx, $body) {
     mode       = $mode
     turn_index = Get-Field $body 'turn_index' $null
     degraded   = $degraded
+    t_sec          = Get-Field $body 't_sec' $null
+    memory_status  = $mem.status
+    memory_focus   = $useMemFocus
+    memory_chapter = $mem.chapter
+    recall_hits    = $mem.recall_hits
+    recall_layer   = $(if ($mem.recall_hits) { $mem.recall_layer } else { $null })
   }
 
   Start-Sse $ctx
@@ -789,6 +1521,7 @@ function Invoke-Followup($ctx, $body) {
           timestamp  = $timestamp
           transcript = $transcript
           question   = $followUp
+          outline    = $mem.outline
         } $meta
       }
       $route = $routeInfo.route
@@ -820,6 +1553,11 @@ function Invoke-Followup($ctx, $body) {
       follow_up        = $followUp
       history_summary  = Format-History (Get-Field $body 'history' $null)
       transcript       = $(if ($degraded) { $T_NO_TRANSCRIPT } else { $transcript })
+      global_layer     = $mem.global_layer
+      section_layer    = $mem.section_layer
+      recall_layer     = $mem.recall_layer
+      focus_before     = $mem.focus_before
+      focus_after      = $mem.focus_after
     }
     $system = Fill-Template (Read-Prompt 'call3_followup.md') $vars
     # 讲解时本地文字识别读出的画面文字，追问时也带上（模型看不了图，只能靠这个知道画面上写了什么）
@@ -1205,6 +1943,135 @@ function Invoke-SummarizeEndpoint($ctx, $body) {
   return "call4 $($rec.chars)字「$summary」"
 }
 
+# ---------------------------------------------------------------- /memory/*（整片字幕记忆，v1.3 探索）
+function Get-MemStatusObj($mem) {
+  if (-not $mem) { return [ordered]@{ status = 'none' } }
+  $chunks = @($mem.chunks)
+  return [ordered]@{
+    status     = [string]$mem.status
+    source     = [string]$mem.source
+    hash       = [string]$mem.hash
+    cues       = @($mem.cues).Count
+    chunks     = $chunks.Count
+    chunks_llm = @($chunks | Where-Object { $_.src -eq 'llm' }).Count
+    chapters   = $(if ($mem.global) { @($mem.global.chapters).Count } else { 0 })
+    topic      = $(if ($mem.global) { [string]$mem.global.topic } else { $null })
+    progress   = $mem.progress
+    error      = $mem.error
+    built_ms   = $mem.built_ms
+    updated    = $mem.updated
+  }
+}
+
+# 扩展拿到整片字幕后调用。立即返回，生成在后台进行（主循环推进）。
+# 同一份字幕（hash 相同）已生成好就直接返回；字幕变了（例如边看边抓的字幕变多了）只重做原文变了的小节。
+function Invoke-MemoryBuild($ctx, $body) {
+  $cfg = Get-Config
+  $ms = Get-MemSettings $cfg
+  $vid = [string](Get-Field $body 'video_id' '')
+  if (-not $vid) { Send-Json $ctx 400 @{ error = 'video_id 不能为空' }; return 'memory build: no video_id' }
+  if (-not $ms.enabled) { Send-Json $ctx 200 @{ status = 'disabled' }; return 'memory disabled' }
+  $source = Get-NonEmpty $body 'source' 'bilibili'
+  $cues = ConvertTo-MemCues (Get-Field $body 'cues' @())
+  if ($cues.Count -lt 5) { Send-Json $ctx 200 @{ status = 'too_short'; cues = $cues.Count }; return "memory too short ($($cues.Count))" }
+  $hash = Get-CuesHash $cues $ms
+  $old = Get-Memory $vid
+  $job = $script:MemJobs[$vid]
+  $force = (Get-Field $body 'force' $false) -eq $true
+
+  if ($job -and -not $force) {
+    # 整片字幕优先于边看边抓：正在用边看边抓的字幕生成时，来了整片字幕就换掉
+    if (-not ($job.mem.source -eq 'live' -and $source -ne 'live')) {
+      Send-Json $ctx 200 (Get-MemStatusObj $job.mem)
+      return "memory $vid 生成中 $($job.done)/$($job.total)"
+    }
+  }
+  if ($old -and $old.source -ne 'live' -and $source -eq 'live' -and -not $force) {
+    Send-Json $ctx 200 (Get-MemStatusObj $old)
+    return "memory $vid 已有整片字幕记忆，忽略边看边抓"
+  }
+  if ($old -and $old.hash -eq $hash -and -not $force -and ($old.status -eq 'ready' -or -not (Test-HasKey $cfg))) {
+    Send-Json $ctx 200 (Get-MemStatusObj $old)
+    return "memory $vid 已就绪（$($old.status)）"
+  }
+
+  $chunks = Split-MemChunks $cues $ms
+  $dur = 0.0
+  try { $dur = [double](Get-Field $body 'duration' 0) } catch {}
+  if ($dur -le 0) { $dur = [double]$cues[$cues.Count - 1].e }
+  $mem = [ordered]@{
+    version  = $MEM_VERSION
+    video_id = $vid
+    subject  = Get-NonEmpty $body 'subject' $T_UNKNOWN_SUBJECT
+    desc     = Limit-Text ([string](Get-Field $body 'desc' '')) 300
+    source   = $source
+    lan      = [string](Get-Field $body 'lan' '')
+    hash     = $hash
+    duration = $dur
+    status   = 'building'
+    error    = $null
+    model    = $null
+    progress = $null
+    built_ms = $null
+    updated  = $null
+    global   = $null
+    chunks   = $chunks
+    cues     = $cues
+  }
+  # 原文没变的小节沿用上次的摘要（小节按原文 hash 对应）
+  $reused = 0
+  if ($old -and -not $force) {
+    $byHash = @{}
+    foreach ($c in @($old.chunks)) { if ($c.src -eq 'llm') { $byHash[[string]$c.hash] = $c } }
+    foreach ($c in $chunks) {
+      $o = $byHash[[string]$c.hash]
+      if ($o) { $c.title = [string]$o.title; $c.summary = [string]$o.summary; $c.terms = @($o.terms); $c.src = 'llm'; $reused++ }
+    }
+  }
+  $script:MemCache[$vid] = $mem
+  if (-not (Test-HasKey $cfg)) {
+    # 没 Key 也能用：焦点层和回溯层不需要模型，只是没有摘要和大纲
+    $mem.status = 'raw'
+    $mem.error = 'no_api_key'
+    Save-Memory $mem
+    Send-Json $ctx 200 (Get-MemStatusObj $mem)
+    return "memory $vid 没有 Key，只存原文 $($cues.Count) 句"
+  }
+  Start-MemoryJob $mem $cfg
+  Save-Memory $mem
+  Step-MemoryJobs
+  Send-Json $ctx 200 (Get-MemStatusObj $mem)
+  return "memory $vid 开始生成：$source $($cues.Count) 句 → $($chunks.Count) 小节（沿用 $reused），map $($script:MemJobs[$vid].total) 批"
+}
+
+function Invoke-MemoryStatus($ctx) {
+  $vid = [string]$ctx.Request.QueryString['video_id']
+  Send-Json $ctx 200 (Get-MemStatusObj (Get-Memory $vid))
+  return 'quiet'
+}
+
+# 调试 / 演示用：看某个时间点实际会拼给模型的四层上下文
+function Invoke-MemoryContextEndpoint($ctx, $body) {
+  $cfg = Get-Config
+  $vid = [string](Get-Field $body 'video_id' '')
+  $question = [string](Get-Field $body 'question' '')
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $r = Get-MemoryVars $cfg $vid (Get-Field $body 't' $null) $question ([string](Get-Field $body 'transcript' ''))
+  Send-Json $ctx 200 ([ordered]@{
+      used          = $r.used
+      status        = $r.status
+      chapter       = $r.chapter
+      chunk_index   = $r.chunk_index
+      global_layer  = $r.global_layer
+      section_layer = $r.section_layer
+      focus         = $r.focus
+      recall_layer  = $r.recall_layer
+      outline       = $r.outline
+      ms            = $sw.ElapsedMilliseconds
+    })
+  return "memory context $vid t=$(Get-Field $body 't' '?') 回溯=$($r.recall_hits)"
+}
+
 # ---------------------------------------------------------------- /log（客户端事件）
 function Invoke-ClientLog($ctx, $body) {
   $rec = [ordered]@{ type = 'client_event' }
@@ -1234,6 +2101,9 @@ function Invoke-Request($ctx) {
     'POST /ocr'     { return (Invoke-OcrEndpoint $ctx (Read-Body $ctx)) }
     'POST /asr'     { return (Invoke-AsrEndpoint $ctx (Read-Body $ctx)) }
     'POST /summarize' { return (Invoke-SummarizeEndpoint $ctx (Read-Body $ctx)) }
+    'POST /memory/build'   { return (Invoke-MemoryBuild $ctx (Read-Body $ctx)) }
+    'GET /memory/status'   { return (Invoke-MemoryStatus $ctx) }
+    'POST /memory/context' { return (Invoke-MemoryContextEndpoint $ctx (Read-Body $ctx)) }
     default {
       Send-Json $ctx 404 @{ error = "没有这个接口：$method $path" }
       return 'not found'
@@ -1289,7 +2159,7 @@ Write-Host ''
 try {
   while ($listener.IsListening) {
     $ar = $listener.BeginGetContext($null, $null)
-    while (-not $ar.AsyncWaitHandle.WaitOne(250)) { }
+    while (-not $ar.AsyncWaitHandle.WaitOne(250)) { Step-MemoryJobs }
     $ctx = $listener.EndGetContext($ar)
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $summary = ''
@@ -1303,6 +2173,7 @@ try {
     if ($summary -ne 'preflight' -and $summary -ne 'quiet') {
       Write-Host ('[{0}] {1,-4} {2,-10} {3,6}ms  {4}' -f (Get-Date -Format 'HH:mm:ss'), $ctx.Request.HttpMethod, $ctx.Request.Url.AbsolutePath, $sw.ElapsedMilliseconds, $summary)
     }
+    Step-MemoryJobs
   }
 } finally {
   $listener.Stop()

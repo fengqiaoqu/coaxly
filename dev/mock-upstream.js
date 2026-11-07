@@ -10,11 +10,14 @@
 //   追问里含 "天气"/"游戏" → 路由判为 off_topic；含 "先修"/"高中" → related_general
 //   Call 4（system 里含「一句话说明」）→ 按追问里有没有「懂了」返回一句话说明（v1.2）
 //   POST /v1/audio/transcriptions → 云端语音识别（v1.2，asr.engine = "cloud" 时用）；model 含 "fail" 返回 500
+//   整片记忆（v1.3，system 里含「分层记忆·小节」/「分层记忆·全片」）→ 按字幕原文拼出小节摘要 / 章节大纲（JSON）
+//   GET /__last?kind=call2  → 某一类调用最后一次的请求体（后台的整片记忆调用不会冲掉前台的 call2）
 'use strict';
 const http = require('http');
 
 const port = Number(process.argv[2]) || 9901;
 let last = null;
+const lastByKind = {};
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const textOf = (content) => (Array.isArray(content) ? content.filter((c) => c.type === 'text').map((c) => c.text).join('') : String(content || ''));
@@ -57,8 +60,46 @@ function summary(system) {
   return '“线性无关”就是每个向量都带来一个新方向';
 }
 
+// ---------------- 整片记忆（v1.3）：不懂内容，只按原文里出现的术语拼一个像样的摘要
+const MEM_TERMS = ['极大线性无关组', '齐次线性方程组', '初等行变换', '线性无关', '线性相关', '线性组合', '张成', '零解', '共线', '共面', '秩'];
+const plain = (t) => t.replace(/\[\d{1,3}:\d{2}\]\s*/g, '').replace(/\s+/g, '');
+function memMap(user) {
+  const chunks = [];
+  const re = /### 小节 (\d+) \[[^\]]*\]\n([\s\S]*?)(?=\n\n### 小节 |$)/g;
+  let m;
+  while ((m = re.exec(user))) {
+    const text = plain(m[2]);
+    const terms = MEM_TERMS.filter((t) => text.includes(t) && !MEM_TERMS.some((u) => u !== t && u.includes(t) && text.includes(u))).slice(0, 4);
+    const title = (terms[0] || text.slice(0, 6)) + (/例|比如/.test(text) ? '的例子' : /定义/.test(text) ? '的定义' : '');
+    chunks.push({ i: Number(m[1]), title: title.slice(0, 12), summary: '老师讲' + text.slice(0, 40) + '…', terms });
+  }
+  return { chunks };
+}
+function memReduce(user) {
+  const rows = user.split('\n').map((l) => l.match(/^\[(\d+)\] \[[^\]]*\] ([^：]*)：?(.*)$/)).filter(Boolean)
+    .map((m) => ({ i: Number(m[1]), title: m[2].replace('（这一节没有摘要，原文开头）', '') || '小节' + m[1], rest: m[3] }));
+  const n = rows.length;
+  const k = n < 3 ? n : Math.min(10, Math.max(3, Math.ceil(n / 2)));
+  const chapters = [];
+  for (let c = 0; c < k; c++) {
+    const from = Math.floor((c * n) / k);
+    const to = Math.floor(((c + 1) * n) / k) - 1;
+    chapters.push({ from: rows[from].i, to: rows[to].i, title: rows[from].title.slice(0, 14) });
+  }
+  const terms = [];
+  for (const r of rows) {
+    for (const t of ((r.rest.match(/术语：([^）]*)/) || [])[1] || '').split('、').filter(Boolean)) {
+      if (!terms.some((x) => x.term === t) && terms.length < 12) terms.push({ term: t, def: t + '的人话定义（mock）', chunk: r.i });
+    }
+  }
+  return { topic: '向量组的线性相关性', summary: '从线性组合出发，' + chapters.map((c) => c.title).join('，然后') + '。', chapters, terms };
+}
+
 http.createServer(async (req, res) => {
-  if (req.method === 'GET' && req.url === '/__last') return send(res, 200, last || {});
+  if (req.method === 'GET' && req.url.startsWith('/__last')) {
+    const kind = new URL(req.url, 'http://x').searchParams.get('kind');
+    return send(res, 200, (kind ? lastByKind[kind] : last) || {});
+  }
   if (req.method === 'POST' && req.url.endsWith('/audio/transcriptions')) {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -82,7 +123,9 @@ http.createServer(async (req, res) => {
   const user = textOf(userContent);
   const image = hasImage(userContent);
   const unresolved = (system.match(/\{\{\w+\}\}/g) || []);
-  const kind = /query router/.test(system) ? 'call1' : /一句话说明/.test(system) ? 'call4' : body.stream ? 'call3' : 'call2';
+  const kind = /query router/.test(system) ? 'call1' : /一句话说明/.test(system) ? 'call4'
+    : /分层记忆·小节/.test(system) ? 'mem_map' : /分层记忆·全片/.test(system) ? 'mem_reduce' : body.stream ? 'call3' : 'call2';
+  lastByKind[kind] = body;
   console.log(`[mock] ${kind} model=${body.model} t=${body.temperature} stream=${!!body.stream} json=${!!body.response_format} image=${image} auth=${(req.headers.authorization || '').slice(0, 12)}… unresolved=${unresolved.join(',') || 'none'} user=${user.slice(0, 30)}`);
 
   if (body.response_format && /nojson/.test(body.model)) return send(res, 400, { error: { message: 'response_format is not supported' } });
@@ -92,10 +135,12 @@ http.createServer(async (req, res) => {
   if (kind === 'call1') content = /badjson/.test(body.model) ? '我觉得这是视频内的问题' : '```json\n' + JSON.stringify(route(user)) + '\n```';
   else if (kind === 'call2') content = explain(user, body.temperature, system);
   else if (kind === 'call4') content = '“' + summary(system) + '”';
+  else if (kind === 'mem_map') content = JSON.stringify(memMap(user));
+  else if (kind === 'mem_reduce') content = JSON.stringify(memReduce(user));
   else content = followup(user, system);
 
   if (!body.stream) {
-    await sleep(kind === 'call1' || kind === 'call4' ? 120 : 600);
+    await sleep(kind === 'call1' || kind === 'call4' ? 120 : kind.startsWith('mem_') ? 900 : 600);
     return send(res, 200, { id: 'mock', object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }] });
   }
 

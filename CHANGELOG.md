@@ -1,5 +1,15 @@
 # 版本记录
 
+## v1.3 探索：整片字幕的分层记忆（分支 `claude/video-subtitle-memory-layers-a382cf`，未合并）· 2026-11-08
+
+方案：[docs/v1.3-记忆分层-方案.md](docs/v1.3-记忆分层-方案.md)。
+
+- **整片字幕**：打开视频页时从 B 站接口取整份 CC / AI 字幕；取不到时退回边播边记，求助前把已播过的字幕交给代理。焦点窗口也从整片字幕切，没播过的地方、暂停点之后 30 秒都有字幕。
+- **分层记忆**：代理新接口 `POST /memory/build`、`GET /memory/status`、`POST /memory/context`。后台把字幕切成小节，map（`prompts/memory_map.md`）写每节摘要，reduce（`prompts/memory_reduce.md`）汇总主线、章节和术语；存 `data/memory/`，字幕变了只重做变了的小节。
+- **四层上下文**：`/explain`、`/followup` 多带 `t_sec`，代理拼全局层 / 章节层 / 焦点层 / 回溯层。`call1_router.md`、`call2_explain.md`、`call2_degraded.md`、`call3_followup.md` 跟着改。字幕和记忆对不上时这次不用记忆。
+- **开发自测**：`dev/sample-subtitles.json`（约 8 分钟样例课）、`dev/test-page.html?full=1`，模拟上游支持 map / reduce。
+- 只用模拟上游测过；真模型效果、真实 B 站页面上取字幕都还没验证。
+
 ## v1.2（1.2.0）· 2026-11-07
 
 需求来源：知识库 `1107视频交互辅助学习/v1.2.md`（1 个 bug + 2 条建议）。实施方案：[docs/v1.2-方案.md](docs/v1.2-方案.md)；对提示词工程规格的影响：[docs/v1.2-规格变更.md](docs/v1.2-规格变更.md)。
