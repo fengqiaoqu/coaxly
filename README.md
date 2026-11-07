@@ -20,6 +20,8 @@ CHANGELOG.md              版本记录
 
 ## 快速开始
 
+> 让 AI Agent（Claude Code、Codex 等）替你安装：把 [INSTALL.md](INSTALL.md) 交给它。
+
 1. **填 Key**：打开 `proxy/config.json`，把 `apiKey` 填上。默认配的是阿里云百炼（通义千问），换别家见下文。
 2. **启动代理**：双击 `启动.bat`。看到「学习搭子 v1.2.0 · 本地代理已启动」和「API Key 已配置」就好，**这个窗口要一直开着**。
 3. **装扩展**：Chrome 打开 `chrome://extensions` → 右上角打开「开发者模式」→「加载已解压的扩展程序」→ 选 `extension` 文件夹。
