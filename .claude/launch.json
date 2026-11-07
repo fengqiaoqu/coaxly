@@ -6,6 +6,18 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "http.server", "8790", "--bind", "127.0.0.1"],
       "port": 8790
+    },
+    {
+      "name": "mock-upstream",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["dev/mock-upstream.js", "9901"],
+      "port": 9901
+    },
+    {
+      "name": "proxy-dev",
+      "runtimeExecutable": "powershell.exe",
+      "runtimeArgs": ["-NoProfile", "-File", "proxy/server.ps1", "-ConfigPath", "dev/mock-config.json", "-LogPath", "data/dev-calls.jsonl"],
+      "port": 8788
     }
   ]
 }

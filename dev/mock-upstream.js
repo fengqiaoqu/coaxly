@@ -8,6 +8,8 @@
 //   model 含 "badjson"   → 路由返回非 JSON（测 2-gram 兜底）
 //   问题里含 "超长"       → Call 2 在 temperature 0.4 时返回超过 120 字（测降温重试）
 //   追问里含 "天气"/"游戏" → 路由判为 off_topic；含 "先修"/"高中" → related_general
+//   Call 4（system 里含「一句话说明」）→ 按追问里有没有「懂了」返回一句话说明（v1.2）
+//   POST /v1/audio/transcriptions → 云端语音识别（v1.2，asr.engine = "cloud" 时用）；model 含 "fail" 返回 500
 'use strict';
 const http = require('http');
 
@@ -48,8 +50,28 @@ function send(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
+function summary(system) {
+  const asked = (system.match(/问：[^\n]*/g) || []).join('\n');
+  if (/还是不懂/.test(asked.split('\n').pop() || '')) return '线性无关：仍卡在“拼出来”是什么意思';
+  if (/懂了/.test(asked) && !/不懂/.test(asked.split('\n').pop() || '')) return '线性无关：谁都不能由别的向量拼出来，追问后已懂';
+  return '“线性无关”就是每个向量都带来一个新方向';
+}
+
 http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/__last') return send(res, 200, last || {});
+  if (req.method === 'POST' && req.url.endsWith('/audio/transcriptions')) {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const buf = Buffer.concat(chunks);
+    const model = (buf.toString('latin1').match(/name="model"\r\n\r\n([^\r]*)/) || [])[1] || '';
+    const hasWav = buf.includes(Buffer.from('RIFF')) && buf.includes(Buffer.from('WAVE'));
+    console.log(`[mock] asr model=${model} bytes=${buf.length} wav=${hasWav} auth=${(req.headers.authorization || '').slice(0, 12)}…`);
+    last = { asr: true, model, bytes: buf.length, wav: hasWav };
+    if (/fail/.test(model)) return send(res, 500, { error: { message: 'mock asr failure' } });
+    if (!hasWav) return send(res, 400, { error: { message: 'no wav file' } });
+    await sleep(150);
+    return send(res, 200, { text: '线性无关到底是什么意思（云端识别）' });
+  }
   if (req.method !== 'POST' || !req.url.endsWith('/chat/completions')) return send(res, 404, { error: { message: 'not found' } });
   let raw = '';
   for await (const chunk of req) raw += chunk;
@@ -60,7 +82,7 @@ http.createServer(async (req, res) => {
   const user = textOf(userContent);
   const image = hasImage(userContent);
   const unresolved = (system.match(/\{\{\w+\}\}/g) || []);
-  const kind = /query router/.test(system) ? 'call1' : body.stream ? 'call3' : 'call2';
+  const kind = /query router/.test(system) ? 'call1' : /一句话说明/.test(system) ? 'call4' : body.stream ? 'call3' : 'call2';
   console.log(`[mock] ${kind} model=${body.model} t=${body.temperature} stream=${!!body.stream} json=${!!body.response_format} image=${image} auth=${(req.headers.authorization || '').slice(0, 12)}… unresolved=${unresolved.join(',') || 'none'} user=${user.slice(0, 30)}`);
 
   if (body.response_format && /nojson/.test(body.model)) return send(res, 400, { error: { message: 'response_format is not supported' } });
@@ -69,10 +91,11 @@ http.createServer(async (req, res) => {
   let content;
   if (kind === 'call1') content = /badjson/.test(body.model) ? '我觉得这是视频内的问题' : '```json\n' + JSON.stringify(route(user)) + '\n```';
   else if (kind === 'call2') content = explain(user, body.temperature, system);
+  else if (kind === 'call4') content = '“' + summary(system) + '”';
   else content = followup(user, system);
 
   if (!body.stream) {
-    await sleep(kind === 'call1' ? 120 : 600);
+    await sleep(kind === 'call1' || kind === 'call4' ? 120 : 600);
     return send(res, 200, { id: 'mock', object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }] });
   }
 

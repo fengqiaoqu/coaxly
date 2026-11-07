@@ -1,0 +1,13 @@
+{
+  "_说明": "开发自测用：代理连 dev/mock-upstream.js（node dev/mock-upstream.js 9901），端口 8788，日志写 data/dev-calls.jsonl。见 .claude/launch.json 的 mock-upstream / proxy-dev。",
+  "baseUrl": "http://127.0.0.1:9901/v1",
+  "apiKey": "mock-key",
+  "model": "mock-chat",
+  "visionModel": "mock-vision",
+  "sendImage": true,
+  "ocr": true,
+  "port": 8788,
+  "httpProxy": "",
+  "timeoutSec": 30,
+  "asr": { "engine": "local" }
+}

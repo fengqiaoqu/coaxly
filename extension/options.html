@@ -50,11 +50,29 @@
   #status.ok { color: var(--ok); }
   #status.err { color: var(--err); }
   code { font: 12px ui-monospace, Consolas, monospace; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+  .ver { margin-left: 6px; padding: 1px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 600; vertical-align: middle; }
+  .sub { margin: 4px 0 12px 26px; }
+  .sub .seg label { padding: 3px 12px; font-size: 13px; }
+  .hist-video { border-top: 1px solid var(--line); padding: 12px 0 4px; }
+  .hist-video:first-child { border-top: 0; padding-top: 4px; }
+  .hist-video h3 { margin: 0 0 6px; font-size: 13px; display: flex; gap: 8px; align-items: baseline; }
+  .hist-video h3 .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hist-video h3 .n { flex: none; color: var(--ink-3); font-weight: 400; font-size: 12px; }
+  .hist-node { display: flex; gap: 10px; width: 100%; margin: 2px 0; padding: 7px 8px; border: 0; border-radius: 8px; background: transparent; text-align: left; }
+  .hist-node:hover { background: var(--accent-soft); }
+  .hist-node:disabled { cursor: default; opacity: .6; }
+  .hist-node:disabled:hover { background: transparent; }
+  .hist-node .ts { flex: none; font: 600 12px/1.7 ui-monospace, Consolas, monospace; color: var(--accent); }
+  .hist-node .body { flex: 1; min-width: 0; }
+  .hist-node .sum { display: block; font-size: 13px; line-height: 1.55; word-break: break-word; }
+  .hist-node .meta { display: block; font-size: 11px; color: var(--ink-3); }
+  .more { margin: 4px 0 0 8px; padding: 2px 6px; border: 0; background: transparent; color: var(--accent); font-size: 12px; }
+  #histList:empty::before { content: "还没有学习历史。"; color: var(--ink-3); font-size: 13px; }
 </style>
 </head>
 <body>
 <main>
-  <h1>学习搭子设置</h1>
+  <h1>学习搭子设置<span class="ver" id="ver"></span></h1>
   <p class="lead">看 B 站课程时暂停，点「我这里不懂」或按 <code>1</code>，右侧抽屉里给出即时解释。</p>
 
   <section>
@@ -81,9 +99,20 @@
       <span>播放时读取画面里的硬字幕<small>有些视频的字幕是直接烧在画面里的，播放器读不到。开启后，没有 CC / AI 字幕时每 1.5 秒识别一次画面底部，图片只发给本机代理，不上传。</small></span>
     </label>
     <label class="check">
-      <input type="checkbox" id="voice">
-      <span>启用语音追问<small>使用浏览器自带的语音识别；连不上时请直接打字。</small></span>
+      <input type="checkbox" id="subGuide">
+      <span>抓不到字幕时主动提醒<small>播放 20 秒还没抓到任何字幕，就在播放器上方提醒你打开字幕（每个视频只提醒一次）。求助时的字幕指引卡片不受这个开关影响。</small></span>
     </label>
+    <label class="check">
+      <input type="checkbox" id="voice">
+      <span>启用语音追问<small>点抽屉里的麦克风说话，说完停一下自动发送。第一次用时 B 站页面会请求麦克风权限，选「允许」。</small></span>
+    </label>
+    <div class="sub">
+      <div class="seg" role="radiogroup" aria-label="语音识别方式">
+        <label><input type="radio" name="voiceEngine" value="local"><span>本机识别</span></label>
+        <label><input type="radio" name="voiceEngine" value="browser"><span>浏览器自带</span></label>
+      </div>
+      <small class="hint">「本机识别」：录音交给本地代理，用 Windows 自带的离线中文识别，不联网（推荐）。<br>「浏览器自带」：Chrome 的识别要访问 Google，国内网络一般用不了。</small>
+    </div>
     <div class="field">
       <span style="display:block;font-weight:600;margin-bottom:6px">追问模式</span>
       <div class="seg" role="radiogroup">
@@ -95,12 +124,27 @@
   </section>
 
   <section>
+    <h2>学习历史</h2>
+    <p class="hint" style="margin-top:0">每次求助都会记成一个节点（视频位置 + 一句话说明 + 追问记录），只存在这台电脑的浏览器里。点节点会打开视频、跳到那个位置并还原当时的对话。</p>
+    <label class="check">
+      <input type="checkbox" id="summaryAi">
+      <span>用 AI 生成一句话说明<small>每次关掉抽屉后，本地代理调一次模型写一句话说明（很短，约 100 字输入）。关掉后只用规则生成的说明。</small></span>
+    </label>
+    <div id="histList"></div>
+    <div class="row" style="margin-top:12px">
+      <button type="button" id="clearHist">清空学习历史</button>
+      <span id="histStatus" class="hint" style="display:inline"></span>
+    </div>
+  </section>
+
+  <section>
     <h2>本地记录</h2>
     <p class="hint" style="margin-top:0">每个视频最近几次求助会记在浏览器里，用来让解释换个角度、不复读。</p>
     <button type="button" id="clearPast">清空求助记录</button>
     <span id="clearStatus" class="hint" style="display:inline"></span>
   </section>
 </main>
+<script src="history.js"></script>
 <script src="options.js"></script>
 </body>
 </html>

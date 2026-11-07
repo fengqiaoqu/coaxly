@@ -10,7 +10,18 @@
   - 用一个小 shim 代替 chrome.runtime / chrome.storage，直连本地代理（http://localhost:8787）
   - 截图用 canvas 当前帧代替 captureVisibleTab
   - 「字幕烧进画面」：字幕画进视频帧、DOM 里不再有，用来测本地画面识字
+  - v1.2：仿 B 站的字幕菜单（.bpx-player-ctrl-subtitle），可切换「已打开 / 没打开 / 要登录 / 没有字幕 / 没有字幕按钮」
+          视频时间是可跳转的虚拟时钟（MediaStream 本身不能 seek），用来测回溯和「倒回 30 秒」
+          chrome.storage 的 hist:/past: 存进 localStorage，刷新页面历史还在
   打开方式：在项目根目录起一个静态服务器（例如 python -m http.server 8790），访问 /dev/test-page.html
+  地址参数：
+    ?proxy=http://localhost:8788  连别的代理（开发代理见 .claude/launch.json 的 proxy-dev）
+    ?sub=on|off|login|none|nobutton  初始字幕状态（默认 on）
+    ?burn=1        字幕烧进画面
+    ?rate=2        虚拟时钟倍速（测「播放 20 秒无字幕主动提醒」时省时间；不要超过 2）
+    ?fakemic=1     假麦克风：把 dev/sample-question.wav 当作麦克风输入（测本机语音识别全流程）
+    ?mic=deny      模拟麦克风权限被拒
+    ?fresh=1       清空本页保存的历史
 -->
 <style>
   :root { --bg: #f4f5f7; --card: #fff; --ink: #18191c; --ink-2: #61666d; --line: #e3e5e7; }
@@ -26,7 +37,15 @@
   .bpx-player-subtitle-panel-text:empty { display: none; }
   .bpx-player-control-wrap { position: absolute; left: 0; right: 0; bottom: 0; height: 44px; display: flex; align-items: center; gap: 12px; padding: 0 12px; background: linear-gradient(transparent, rgba(0,0,0,.7)); color: #fff; }
   .bpx-player-control-wrap button { background: rgba(255,255,255,.15); color: #fff; border: 0; border-radius: 6px; padding: 4px 12px; cursor: pointer; }
-  .bpx-player-ctrl-subtitle-menu { font-size: 12px; opacity: .8; }
+  .bpx-player-ctrl-subtitle { position: relative; margin-left: auto; }
+  .bpx-player-ctrl-subtitle-menu { position: absolute; right: 0; bottom: 36px; min-width: 170px; padding: 6px; border-radius: 8px; background: rgba(20,20,20,.92); font-size: 12px; display: none; }
+  .bpx-player-ctrl-subtitle.open .bpx-player-ctrl-subtitle-menu { display: block; }
+  .bpx-player-ctrl-subtitle-language-item { padding: 4px 8px; border-radius: 5px; cursor: pointer; list-style: none; }
+  .bpx-player-ctrl-subtitle-language-item:hover { background: rgba(255,255,255,.12); }
+  .bpx-player-ctrl-subtitle-language-item.bpx-state-active { color: #00aeec; }
+  .bpx-player-ctrl-subtitle-language-unlogin { padding: 4px 8px; color: #ffb020; }
+  .bpx-player-ctrl-subtitle ul { margin: 0; padding: 0; }
+  .harness { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-top: 10px; font-size: 13px; color: var(--ink-2); }
   aside .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 12px; color: var(--ink-2); }
   .help { margin-top: 12px; color: var(--ink-2); font-size: 13px; }
   .help code { background: var(--card); border: 1px solid var(--line); padding: 0 4px; border-radius: 4px; }
@@ -43,13 +62,30 @@
       <div class="bpx-player-control-wrap">
         <button id="toggle" type="button">播放</button>
         <span id="clock">00:00</span>
-        <span class="bpx-player-ctrl-subtitle-menu">字幕 · 中文（自动生成）</span>
+        <div class="bpx-player-ctrl-btn bpx-player-ctrl-subtitle" id="subctrl">
+          <button type="button" id="subbtn">字幕</button>
+          <div class="bpx-player-ctrl-subtitle-menu">
+            <div class="bpx-player-ctrl-subtitle-language-unlogin" style="display:none">登录后才能看 AI 字幕</div>
+            <ul id="langs"></ul>
+          </div>
+        </div>
       </div>
     </div>
-    <p class="help">点「播放」，看几秒后暂停 → 画面中央出现「我这里不懂」，或随时按 <code>1</code>。
-      勾选 <label><input type="checkbox" id="nosub"> 关闭字幕</label> 可以测试降级路径；
-      勾选 <label><input type="checkbox" id="burn"> 字幕烧进画面</label> 可以测试画面识字（硬字幕）。
-      地址加 <code>?proxy=http://localhost:8788</code> 可以连别的代理。</p>
+    <p class="help">点「播放」，看几秒后暂停 → 画面中央出现「我这里不懂」，或随时按 <code>1</code>。地址参数见源码顶部注释。</p>
+    <div class="harness">
+      <label>字幕状态
+        <select id="substate">
+          <option value="on">已打开</option>
+          <option value="off">有字幕，没打开</option>
+          <option value="login">要登录</option>
+          <option value="none">没有字幕</option>
+          <option value="nobutton">没有字幕按钮</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="burn"> 字幕烧进画面</label>
+      <button type="button" id="seek0">跳到 00:00</button>
+      <button type="button" id="clearHist">清空本页历史</button>
+    </div>
   </section>
   <aside>
     <div class="card">推荐视频 1</div>
@@ -79,11 +115,58 @@ const LECTURE = [
 ];
 const video = document.getElementById('v');
 const sub = document.getElementById('sub');
+const params = new URLSearchParams(location.search);
+
+// ---------------------------------------------------------------- 可跳转的虚拟时钟（canvas 推流的 <video> 本身不能 seek）
+const RATE = Math.min(2, Math.max(0.25, Number(params.get('rate')) || 1));
+const DURATION = 64;
+const clock = { base: 0, startedAt: null };
+const vnow = () => (clock.startedAt == null ? clock.base : Math.min(DURATION, clock.base + (performance.now() - clock.startedAt) / 1000 * RATE));
+Object.defineProperty(video, 'currentTime', {
+  configurable: true,
+  get: vnow,
+  set: (t) => {
+    clock.base = Math.max(0, Math.min(DURATION, Number(t) || 0));
+    if (clock.startedAt != null) clock.startedAt = performance.now();
+    video.dispatchEvent(new Event('seeking'));
+    setTimeout(() => video.dispatchEvent(new Event('seeked')), 30);
+  },
+});
+Object.defineProperty(video, 'duration', { configurable: true, get: () => DURATION });
+video.addEventListener('play', () => { if (clock.startedAt == null) clock.startedAt = performance.now(); });
+video.addEventListener('pause', () => { clock.base = vnow(); clock.startedAt = null; });
+
+// ---------------------------------------------------------------- 仿 B 站字幕菜单
+const subctrl = document.getElementById('subctrl');
+const langs = document.getElementById('langs');
+const unlogin = subctrl.querySelector('.bpx-player-ctrl-subtitle-language-unlogin');
+const subSel = document.getElementById('substate');
+const subParent = subctrl.parentNode;
+let subState = params.get('sub') || 'on';
+function renderSubCtrl() {
+  subSel.value = subState;
+  if (subState === 'nobutton') { subctrl.remove(); return; }
+  if (!subctrl.isConnected) subParent.appendChild(subctrl);
+  unlogin.style.display = subState === 'login' ? '' : 'none';
+  langs.textContent = '';
+  if (subState === 'none' || subState === 'login') return;
+  for (const [lan, name] of [['ai-zh', '中文（自动生成）'], ['close', '关闭']]) {
+    const li = document.createElement('li');
+    li.className = 'bpx-player-ctrl-subtitle-language-item' + ((subState === 'on' && lan === 'ai-zh') || (subState === 'off' && lan === 'close') ? ' bpx-state-active' : '');
+    li.dataset.lan = lan;
+    li.textContent = name;
+    li.addEventListener('click', () => { subState = lan === 'close' ? 'off' : 'on'; renderSubCtrl(); subctrl.classList.remove('open'); });
+    langs.appendChild(li);
+  }
+}
+renderSubCtrl();
+subSel.addEventListener('change', () => { subState = subSel.value; renderSubCtrl(); });
+document.getElementById('subbtn').addEventListener('click', () => subctrl.classList.toggle('open'));
+document.getElementById('seek0').addEventListener('click', () => { video.currentTime = 0; });
 const canvas = document.createElement('canvas');
 canvas.width = 960; canvas.height = 540;
 const g = canvas.getContext('2d');
 const burn = document.getElementById('burn');
-const params = new URLSearchParams(location.search);
 if (params.get('burn') === '1') burn.checked = true;
 const lineAt = (t) => { let line = ''; for (const [at, text] of LECTURE) if (t >= at) line = text; return line; };
 const fmt = (s) => String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(Math.floor(s % 60)).padStart(2, '0');
@@ -114,7 +197,7 @@ video.srcObject = canvas.captureStream(30);
 function updateSub() {
   const t = video.currentTime || 0;
   document.getElementById('clock').textContent = fmt(t);
-  if (document.getElementById('nosub').checked || burn.checked) { sub.textContent = ''; return; }
+  if (subState !== 'on' || burn.checked) { sub.textContent = ''; return; }
   const line = lineAt(t);
   if (sub.textContent !== line) sub.textContent = line;
 }
@@ -127,10 +210,31 @@ video.addEventListener('pause', () => (toggle.textContent = '播放'));
 // ---------------------------------------------------------------- chrome.* shim
 (() => {
   const PROXY = (new URLSearchParams(location.search).get('proxy') || 'http://localhost:8787').replace(/\/+$/, '');
-  const store = { proxyUrl: PROXY, sendImage: true, hardsub: true, voice: true, mode: 'direct' };
+  const PERSIST_KEY = 'lb_harness_store';
+  const persisted = /^(hist:|past:|pendingRestore$|subGuide$|voiceEngine$|summaryAi$)/;
+  if (params.get('fresh') === '1') { try { localStorage.removeItem(PERSIST_KEY); } catch (_) {} }
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(PERSIST_KEY) || '{}'); } catch (_) {}
+  const store = { proxyUrl: PROXY, sendImage: true, hardsub: true, voice: true, mode: 'direct', ...saved };
+  const persist = () => {
+    const out = {};
+    for (const [k, v] of Object.entries(store)) if (persisted.test(k)) out[k] = v;
+    try { localStorage.setItem(PERSIST_KEY, JSON.stringify(out)); } catch (_) {}
+  };
+  const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
   const changeListeners = [];
   const later = (fn) => setTimeout(fn, 0);
+  const notify = (changes) => later(() => changeListeners.forEach((f) => f(changes, 'local')));
   async function handle(msg) {
+    if (msg.type === 'hist:list') {
+      if (store.summaryAi !== false) later(() => LBHistory.backfill(msg.videoId, (path, body) => handle({ type: 'call', path, body })));
+      return { ok: true, data: await LBHistory.list(msg.videoId) };
+    }
+    if (msg.type === 'hist:put') {
+      const entry = await LBHistory.put(msg.node);
+      if (msg.summarize && store.summaryAi !== false) LBHistory.summarize(msg.node.videoId, msg.node.id, (path, body) => handle({ type: 'call', path, body }), msg.sessionId);
+      return { ok: true, data: entry };
+    }
     if (msg.type === 'capture') {
       return { ok: true, dataUrl: canvas.toDataURL('image/jpeg', 0.7) };
     }
@@ -182,27 +286,65 @@ video.addEventListener('pause', () => (toggle.textContent = '播放'));
     sendMessage: (msg, cb) => { handle(msg).then((r) => cb && later(() => cb(r))); },
     connect: () => makePort(),
   };
+  const reply = (cb, value) => { if (cb) { later(() => cb(value)); return undefined; } return Promise.resolve(value); };
   const storage = {
     local: {
-      get: (defaults, cb) => {
-        const keys = defaults && typeof defaults === 'object' ? defaults : {};
+      get: (keys, cb) => {
         const out = {};
-        for (const [k, v] of Object.entries(keys)) out[k] = k in store ? store[k] : v;
-        later(() => cb(out));
+        if (keys == null) Object.assign(out, clone(store));
+        else if (typeof keys === 'string') { if (keys in store) out[keys] = clone(store[keys]); }
+        else if (Array.isArray(keys)) { for (const k of keys) if (k in store) out[k] = clone(store[k]); }
+        else for (const [k, v] of Object.entries(keys)) out[k] = k in store ? clone(store[k]) : v;
+        return reply(cb, out);
       },
-      set: (obj) => {
+      set: (obj, cb) => {
         const changes = {};
-        for (const [k, v] of Object.entries(obj)) { changes[k] = { oldValue: store[k], newValue: v }; store[k] = v; }
-        later(() => changeListeners.forEach((f) => f(changes, 'local')));
+        for (const [k, v] of Object.entries(obj)) { changes[k] = { oldValue: store[k], newValue: clone(v) }; store[k] = clone(v); }
+        persist();
+        notify(changes);
+        return reply(cb);
       },
+      remove: (keys, cb) => {
+        const changes = {};
+        for (const k of [].concat(keys)) if (k in store) { changes[k] = { oldValue: store[k] }; delete store[k]; }
+        persist();
+        if (Object.keys(changes).length) notify(changes);
+        return reply(cb);
+      },
+      getBytesInUse: (keys, cb) => reply(cb, JSON.stringify(store).length),
     },
     onChanged: { addListener: (f) => changeListeners.push(f) },
   };
   try { Object.defineProperty(window.chrome, 'runtime', { value: runtime, configurable: true }); } catch (_) { window.chrome.runtime = runtime; }
   try { Object.defineProperty(window.chrome, 'storage', { value: storage, configurable: true }); } catch (_) { window.chrome.storage = storage; }
   window.__harnessStore = store;
+  document.getElementById('clearHist').addEventListener('click', () => {
+    storage.local.remove(Object.keys(store).filter((k) => /^(hist:|past:)/.test(k)));
+  });
+
+  // ---------------- 假麦克风（?fakemic=1）/ 权限被拒（?mic=deny）
+  if (navigator.mediaDevices && (params.get('fakemic') === '1' || params.get('mic') === 'deny')) {
+    navigator.mediaDevices.getUserMedia = async () => {
+      if (params.get('mic') === 'deny') throw new DOMException('Permission denied', 'NotAllowedError');
+      const ac = new AudioContext();
+      const buf = await ac.decodeAudioData(await (await fetch('sample-question.wav')).arrayBuffer());
+      const src = ac.createBufferSource();
+      src.buffer = buf;
+      const dest = ac.createMediaStreamDestination();
+      src.connect(dest);
+      src.start();
+      window.__fakeMic = { duration: buf.duration, startedAt: performance.now() };
+      const stream = dest.stream;
+      for (const t of stream.getAudioTracks()) {
+        const stop = t.stop.bind(t);
+        t.stop = () => { stop(); try { src.stop(); } catch (_) {} ac.close(); };
+      }
+      return stream;
+    };
+  }
 })();
 </script>
+<script src="../extension/history.js"></script>
 <script src="../extension/content.js"></script>
 </body>
 </html>

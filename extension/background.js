@@ -2,10 +2,14 @@
  * 1. 转发内容脚本到本地代理的请求（扩展只认代理地址，永远不接触 API Key）
  * 2. Call 3 的 SSE 流：chrome.runtime.connect({name:'stream'}) 长连接逐块转发
  * 3. 截图：captureVisibleTab → OffscreenCanvas 裁出视频矩形（绕开 B 站跨域视频污染画布的问题）
+ * 4. 历史节点（v1.2）：所有标签页的节点都由这里统一写入 chrome.storage.local，会话结束后调 /summarize 生成一句话说明。
+ *    放在后台做，页面关掉了说明也照样会生成。
  */
 'use strict';
 
-const DEFAULTS = { proxyUrl: 'http://localhost:8787', sendImage: true };
+importScripts('history.js');
+
+const DEFAULTS = { proxyUrl: 'http://localhost:8787', sendImage: true, summaryAi: true };
 const MAX_FRAME_WIDTH = 960;
 
 async function getSettings() {
@@ -86,6 +90,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return sendResponse(await captureFrame(sender.tab, msg.rect, msg.viewport));
       }
       if (msg.type === 'openOptions') { chrome.runtime.openOptionsPage(); return sendResponse({ ok: true }); }
+      if (msg.type === 'hist:list') {
+        sendResponse({ ok: true, data: await LBHistory.list(msg.videoId) });
+        const settings = await getSettings();
+        if (settings.summaryAi !== false) await LBHistory.backfill(msg.videoId, callProxy);
+        return undefined;
+      }
+      if (msg.type === 'hist:put') {
+        const entry = await LBHistory.put(msg.node);
+        sendResponse({ ok: true, data: entry });
+        if (msg.summarize) {
+          const settings = await getSettings();
+          if (settings.summaryAi !== false) await LBHistory.summarize(msg.node.videoId, msg.node.id, callProxy, msg.sessionId);
+        }
+        return undefined;
+      }
       sendResponse({ ok: false, error: 'unknown_message' });
     } catch (e) {
       sendResponse({ ok: false, error: String((e && e.message) || e) });

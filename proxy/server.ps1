@@ -12,10 +12,14 @@
     POST /route     Call 1 上下文路由（JSON 模式，失败走 2-gram 规则兜底）
     POST /followup  Call 3 追问续接（SSE 流式；首轮追问时先在内部跑 Call 1）
     POST /log       客户端事件（例如关闭抽屉 → user_closed_without_followup）
+    POST /ocr       画面识字（本地 Windows OCR）
+    POST /asr       语音识别（v1.2：默认 Windows 本机离线识别，可选云端 /audio/transcriptions）
+    POST /summarize Call 4：历史节点的一句话说明（v1.2）
 #>
 param(
   [string]$ConfigPath = '',
-  [int]$Port = 0
+  [int]$Port = 0,
+  [string]$LogPath = ''   # 开发自测时把日志写到别处，不混进正式的 data/calls.jsonl
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,7 +30,9 @@ $Root      = Split-Path -Parent $ProxyDir
 $PromptDir = Join-Path $Root 'prompts'
 $DataDir   = Join-Path $Root 'data'
 $LogFile   = Join-Path $DataDir 'calls.jsonl'
+if ($LogPath) { $LogFile = $(if ([IO.Path]::IsPathRooted($LogPath)) { $LogPath } else { Join-Path $Root $LogPath }) }
 if (-not $ConfigPath) { $ConfigPath = Join-Path $ProxyDir 'config.json' }
+elseif (-not [IO.Path]::IsPathRooted($ConfigPath)) { $ConfigPath = Join-Path $Root $ConfigPath }
 
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 try { [Console]::OutputEncoding = $Utf8 } catch {}
@@ -37,6 +43,8 @@ if (-not (Test-Path $ConfigPath)) {
   $example = Join-Path $ProxyDir 'config.example.json'
   if (Test-Path $example) { Copy-Item $example $ConfigPath }
 }
+
+$VERSION = '1.2.0'
 
 # ---------------------------------------------------------------- 文案常量
 $T_UNKNOWN_SUBJECT  = '未知课程'
@@ -63,6 +71,7 @@ function Get-Config {
     timeoutSec  = 60
     sendImage   = $true
     ocr         = $true
+    asr         = $null
   }
   if (Test-Path $ConfigPath) {
     $raw = [IO.File]::ReadAllText($ConfigPath, $Utf8)
@@ -70,6 +79,9 @@ function Get-Config {
     foreach ($p in $obj.PSObject.Properties) { $cfg[$p.Name] = $p.Value }
   }
   if (-not $cfg.visionModel) { $cfg.visionModel = $cfg.model }
+  $engine = [string](Get-Field $cfg.asr 'engine' 'local')
+  if (@('local', 'cloud', 'off') -notcontains $engine) { $engine = 'local' }
+  $cfg.asrEngine = $engine
   return $cfg
 }
 
@@ -507,7 +519,8 @@ function Send-Json($ctx, [int]$status, $obj) {
   $res.ContentType = 'application/json; charset=utf-8'
   Set-Cors $res
   $res.ContentLength64 = $bytes.Length
-  $res.OutputStream.Write($bytes, 0, $bytes.Length)
+  # HEAD 请求只回头部（之前照样写 body，会报「写入流的字节超出 Content-Length」）
+  if ($ctx.Request.HttpMethod -ne 'HEAD') { $res.OutputStream.Write($bytes, 0, $bytes.Length) }
   $res.OutputStream.Close()
 }
 
@@ -541,6 +554,7 @@ function Invoke-Health($ctx) {
   Send-Json $ctx 200 ([ordered]@{
       ok          = $true
       name        = 'learn-buddy-proxy'
+      version     = $VERSION
       hasKey      = (Test-HasKey $cfg)
       baseUrl     = [string]$cfg.baseUrl
       model       = [string]$cfg.model
@@ -549,6 +563,10 @@ function Invoke-Health($ctx) {
       ocr         = ($cfg.ocr -ne $false)
       ocrReady    = $(if ($cfg.ocr -ne $false) { [bool](Initialize-Ocr).ok } else { $false })
       ocrError    = $(if ($cfg.ocr -ne $false) { (Initialize-Ocr).error } else { $null })
+      asrEngine   = $cfg.asrEngine
+      asrReady    = $(if ($cfg.asrEngine -ne 'off') { [bool](Initialize-Asr).ok } else { $false })
+      asrError    = $(if ($cfg.asrEngine -ne 'off') { (Initialize-Asr).error } else { $null })
+      asrModel    = $(if ($cfg.asrEngine -eq 'cloud') { [string](Get-Field $cfg.asr 'model' '') } else { $null })
       prompts     = $files
     })
   return 'ok'
@@ -922,6 +940,271 @@ function Invoke-OcrEndpoint($ctx, $body) {
   return 'quiet'
 }
 
+# ---------------------------------------------------------------- 语音识别（v1.2）
+# Chrome 自带的语音识别要连 Google，国内用不了。v1.2 改成：扩展只录音（16kHz 单声道 WAV），这里识别。
+# 默认用 Windows 自带的离线中文识别（System.Speech）：不联网、不花钱，短句 100ms 以内。
+# 听写语法之外再加一组「快捷回复」短语语法：纯听写会把「懂了」听成「读了」，加上之后短句基本都准。
+# 可选：config.json 的 asr.engine = "cloud" 时走任一 OpenAI 兼容的 /audio/transcriptions，失败自动退回本机。
+$ASR_QUICK_PHRASES = @(
+  '懂了', '明白了', '知道了', '听懂了', '还是不懂', '没懂', '不懂', '听不懂', '没听懂',
+  '展开讲讲', '展开说说', '详细说说', '多讲一点', '再讲一遍', '换个说法', '举个例子', '再举个例子',
+  '是', '是的', '对', '对的', '不是', '不对', '不确定', '不知道', '继续',
+  '用你自己的知识解释一下', '不管视频直接讲', '不用管视频'
+)
+$script:AsrState = $null
+
+function Initialize-Asr {
+  if ($null -ne $script:AsrState) { return $script:AsrState }
+  $st = @{ ok = $false; error = $null; engine = $null; lang = ''; name = '' }
+  try {
+    if ($PSVersionTable.PSEdition -eq 'Core') { throw '本机语音识别需要 Windows PowerShell 5.1（用 启动.bat 启动即可）' }
+    Add-Type -AssemblyName System.Speech
+    $info = $null
+    foreach ($r in [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers()) {
+      if ($r.Culture.Name -like 'zh-CN*' -or $r.Culture.Name -like 'zh-Hans*') { $info = $r; break }
+    }
+    if (-not $info) { throw '系统里没有中文语音识别引擎（设置 → 时间和语言 → 语言和区域 → 中文(简体) → 语言选项 → 安装「语音识别」）' }
+    $eng = New-Object System.Speech.Recognition.SpeechRecognitionEngine($info)
+    $dict = New-Object System.Speech.Recognition.DictationGrammar
+    $dict.Name = 'dictation'
+    $eng.LoadGrammar($dict)
+    $choices = New-Object System.Speech.Recognition.Choices
+    $choices.Add([string[]]$ASR_QUICK_PHRASES)
+    $gb = New-Object System.Speech.Recognition.GrammarBuilder($choices)
+    $gb.Culture = $info.Culture
+    $quick = New-Object System.Speech.Recognition.Grammar($gb)
+    $quick.Name = 'quick'
+    $eng.LoadGrammar($quick)
+    $st.engine = $eng
+    $st.lang = [string]$info.Culture.Name
+    $st.name = [string]$info.Name
+    $st.ok = $true
+  } catch {
+    $st.error = $_.Exception.Message
+  }
+  $script:AsrState = $st
+  return $st
+}
+
+# 把 data:audio/wav;base64,... 解成字节，并确认是 WAV（RIFF....WAVE）
+function ConvertFrom-AudioDataUrl([string]$dataUrl) {
+  $comma = $dataUrl.IndexOf(',')
+  if (-not $dataUrl.StartsWith('data:audio/') -or $comma -lt 0) { return $null }
+  try { $bytes = [Convert]::FromBase64String($dataUrl.Substring($comma + 1)) } catch { return $null }
+  if ($bytes.Length -lt 44) { return $null }
+  if ([Text.Encoding]::ASCII.GetString($bytes, 0, 4) -ne 'RIFF' -or [Text.Encoding]::ASCII.GetString($bytes, 8, 4) -ne 'WAVE') { return $null }
+  return , $bytes
+}
+
+function Get-WavSeconds([byte[]]$wav) {
+  try {
+    $ch = [BitConverter]::ToInt16($wav, 22)
+    $rate = [BitConverter]::ToInt32($wav, 24)
+    $bits = [BitConverter]::ToInt16($wav, 34)
+    $bps = [double]$rate * $ch * ($bits / 8)
+    if ($bps -le 0) { return 0 }
+    return [math]::Round(($wav.Length - 44) / $bps, 1)
+  } catch { return 0 }
+}
+
+function Invoke-LocalAsr([byte[]]$wav) {
+  $st = Initialize-Asr
+  if (-not $st.ok) { return @{ ok = $false; code = 'asr_unavailable'; error = $st.error; engine = 'local' } }
+  $ms = New-Object System.IO.MemoryStream(, $wav)
+  $parts = New-Object System.Collections.ArrayList
+  $confs = New-Object System.Collections.ArrayList
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  try {
+    $st.engine.SetInputToWaveStream($ms)
+    # 一段录音里可能有好几句（中间停顿过），逐句识别直到音频读完；读完后再调用会抛 InvalidOperationException
+    for ($i = 0; $i -lt 30 -and $sw.ElapsedMilliseconds -lt 8000; $i++) {
+      $r = $null
+      try { $r = $st.engine.Recognize() } catch { break }
+      if (-not $r) {
+        if ($ms.Position -ge $ms.Length) { break }
+        continue
+      }
+      $t = ([string]$r.Text).Trim()
+      if ($t) { [void]$parts.Add($t); [void]$confs.Add([math]::Round($r.Confidence, 2)) }
+    }
+  } catch {
+    return @{ ok = $false; code = 'asr_failed'; error = '语音识别失败：' + $_.Exception.Message; engine = 'local' }
+  } finally {
+    try { $st.engine.SetInputToNull() } catch {}
+    $ms.Dispose()
+  }
+  # 只有英文/数字之间才需要空格；中文听写结果里偶尔夹的空格去掉
+  $text = [regex]::Replace(($parts -join ''), '(?<=[^A-Za-z0-9])\s+|\s+(?=[^A-Za-z0-9])', '')
+  return @{ ok = $true; text = $text; engine = 'local'; confidence = @($confs); ms = $sw.ElapsedMilliseconds }
+}
+
+function Invoke-CloudAsr($cfg, [byte[]]$wav) {
+  $a = $cfg.asr
+  $base = [string](Get-Field $a 'baseUrl' '')
+  if (-not $base.Trim()) { $base = [string]$cfg.baseUrl }
+  $key = [string](Get-Field $a 'apiKey' '')
+  if (-not $key.Trim()) { $key = [string]$cfg.apiKey }
+  $model = [string](Get-Field $a 'model' '')
+  if (-not $model.Trim()) { return @{ ok = $false; error = 'config.json 里 asr.model 没填' } }
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $client = Get-HttpClient $cfg
+  $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $base.TrimEnd('/') + '/audio/transcriptions')
+  [void]$req.Headers.TryAddWithoutValidation('Authorization', 'Bearer ' + $key.Trim())
+  $form = New-Object System.Net.Http.MultipartFormDataContent
+  $file = New-Object System.Net.Http.ByteArrayContent(, $wav)
+  $file.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse('audio/wav')
+  $form.Add($file, 'file', 'speech.wav')
+  $form.Add((New-Object System.Net.Http.StringContent($model)), 'model')
+  $form.Add((New-Object System.Net.Http.StringContent('zh')), 'language')
+  $form.Add((New-Object System.Net.Http.StringContent('json')), 'response_format')
+  $req.Content = $form
+  try {
+    $resp = $client.SendAsync($req).GetAwaiter().GetResult()
+  } catch {
+    $e = $_.Exception
+    while ($e.InnerException) { $e = $e.InnerException }
+    return @{ ok = $false; error = '云端语音识别请求失败：' + $e.Message }
+  }
+  try {
+    $raw = $Utf8.GetString($resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult())
+    if (-not $resp.IsSuccessStatusCode) { return @{ ok = $false; error = "云端语音识别返回 HTTP $([int]$resp.StatusCode)：" + (Limit-Text $raw 300) } }
+  } finally { $resp.Dispose() }
+  try { $obj = $raw | ConvertFrom-Json } catch { return @{ ok = $false; error = '云端语音识别返回的不是 JSON：' + (Limit-Text $raw 200) } }
+  $text = ([string](Get-Field $obj 'text' '')).Trim()
+  return @{ ok = $true; text = $text; engine = 'cloud'; model = $model; ms = $sw.ElapsedMilliseconds }
+}
+
+function Invoke-AsrEndpoint($ctx, $body) {
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $cfg = Get-Config
+  $rec = [ordered]@{
+    type       = 'asr'
+    session_id = Get-Field $body 'session_id' $null
+    video_id   = Get-Field $body 'video_id' $null
+    engine     = $cfg.asrEngine
+    reason     = Get-Field $body 'reason' $null
+  }
+  if ($cfg.asrEngine -eq 'off') {
+    Send-Json $ctx 200 ([ordered]@{ ok = $false; code = 'asr_disabled'; error = '配置里关掉了语音识别（asr.engine = "off"）' })
+    return 'asr disabled'
+  }
+  $wav = ConvertFrom-AudioDataUrl ([string](Get-Field $body 'audio' ''))
+  if (-not $wav) {
+    Send-Json $ctx 400 ([ordered]@{ ok = $false; code = 'bad_audio'; error = '收到的不是 WAV 录音' })
+    return 'asr bad audio'
+  }
+  $rec.audio_sec = Get-WavSeconds $wav
+  $r = $null
+  if ($cfg.asrEngine -eq 'cloud') {
+    $r = Invoke-CloudAsr $cfg $wav
+    if (-not $r.ok) {
+      $rec.cloud_error = $r.error
+      Write-Host ('    云端语音识别失败，改用本机识别：' + (Limit-Text $r.error 160)) -ForegroundColor DarkYellow
+      $r = $null
+    }
+  }
+  if (-not $r) { $r = Invoke-LocalAsr $wav }
+  $text = [string]$r.text
+  $rec.engine_used = $r.engine
+  $rec.ok = [bool]$r.ok
+  $rec.text = $text
+  $rec.chars = ($text -replace '\s', '').Length
+  $rec.error = $r.error
+  $rec.total_ms = $sw.ElapsedMilliseconds
+  Write-CallLog $rec
+  Send-Json $ctx 200 ([ordered]@{
+      ok          = [bool]$r.ok
+      text        = $text
+      engine      = $r.engine
+      code        = $r.code
+      error       = $r.error
+      cloud_error = $rec.cloud_error
+      audio_sec   = $rec.audio_sec
+      total_ms    = $sw.ElapsedMilliseconds
+    })
+  if (-not $r.ok) { return 'asr failed: ' + (Limit-Text ([string]$r.error) 80) }
+  return "asr $($r.engine) 音频$($rec.audio_sec)s → $($rec.chars)字「$(Limit-Text $text 20)」"
+}
+
+# ---------------------------------------------------------------- /summarize（Call 4：历史节点的一句话说明，v1.2）
+function Format-Turns($turns) {
+  $items = @($turns | Where-Object { $_ })
+  if ($items.Count -eq 0) { return '（没有追问）' }
+  $i = 0
+  $lines = foreach ($t in @($items | Select-Object -Last 6)) {
+    $i++
+    $q = Limit-Text ([string](Get-Field $t 'q' '')) 40
+    $a = Limit-Text (([string](Get-Field $t 'a' '')) -replace '\s+', ' ') 60
+    "${i}. 问：$q → 答：$a"
+  }
+  return (@($lines) -join "`n")
+}
+
+function ConvertTo-OneLine([string]$text) {
+  $t = Remove-Markdown $text
+  $line = [string](@($t -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) | Select-Object -First 1)
+  $line = [regex]::Replace($line, '^(一句话说明|说明|总结)[：:]\s*', '').Trim()
+  # 只剥「整句外面的一对引号」：“线性无关”就是…… 这种开头的引号属于内容，不能剥
+  foreach ($pair in @(@([char]'"', [char]'"'), @([char]0x201C, [char]0x201D), @([char]0x300C, [char]0x300D), @([char]0x0027, [char]0x0027))) {
+    if ($line.Length -ge 2 -and $line[0] -eq $pair[0] -and $line[$line.Length - 1] -eq $pair[1]) {
+      $inner = $line.Substring(1, $line.Length - 2)
+      $open = @($inner.ToCharArray() | Where-Object { $_ -eq $pair[0] }).Count
+      $close = @($inner.ToCharArray() | Where-Object { $_ -eq $pair[1] }).Count
+      if ($pair[0] -eq $pair[1] -or $open -eq $close) { $line = $inner.Trim() }
+      break
+    }
+  }
+  $line = $line.TrimEnd([char]0x3002, [char]'.')
+  return (Limit-Text $line 40)
+}
+
+function Invoke-SummarizeEndpoint($ctx, $body) {
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $cfg = Get-Config
+  $turns = @(Get-Field $body 'turns' @())
+  $transcript = [string](Get-Field $body 'transcript' '')
+  if ($transcript.Length -gt 600) { $transcript = '…' + $transcript.Substring($transcript.Length - 600) }
+  $vars = @{
+    subject          = Get-NonEmpty $body 'subject' $T_UNKNOWN_SUBJECT
+    timestamp        = Get-NonEmpty $body 'timestamp' '00:00'
+    original_concept = Get-NonEmpty $body 'original_concept' $T_DEFAULT_CONCEPT
+    transcript       = $(if ((Get-TranscriptBodyLength $transcript) -lt 10) { $T_NO_TRANSCRIPT } else { $transcript })
+    call2_output     = Get-NonEmpty $body 'call2_output' '（无）'
+    turns            = Format-Turns $turns
+    turn_count       = [string]$turns.Count
+  }
+  $rec = [ordered]@{
+    type       = 'call4'
+    session_id = Get-Field $body 'session_id' $null
+    video_id   = Get-Field $body 'video_id' $null
+    node_id    = Get-Field $body 'node_id' $null
+    timestamp  = $vars.timestamp
+    turn_count = $turns.Count
+  }
+  if (-not (Test-HasKey $cfg)) {
+    $rec.error = 'no_api_key'
+    Write-CallLog $rec
+    Send-Json $ctx 400 @{ error = $T_NO_KEY; code = 'no_api_key' }
+    return 'no api key'
+  }
+  $system = Fill-Template (Read-Prompt 'call4_summary.md') $vars
+  $r = Invoke-Chat $cfg ([string]$cfg.model) $system '请写这条学习记录的一句话说明。' 0.3 80 $null
+  if (-not $r.ok) {
+    $rec.error = $r.error
+    $rec.total_ms = $sw.ElapsedMilliseconds
+    Write-CallLog $rec
+    Send-Json $ctx 502 @{ error = $r.error; code = 'upstream_error' }
+    return 'call4 upstream error'
+  }
+  $summary = ConvertTo-OneLine $r.text
+  $rec.summary = $summary
+  $rec.chars = ($summary -replace '\s', '').Length
+  $rec.total_ms = $sw.ElapsedMilliseconds
+  Write-CallLog $rec
+  Send-Json $ctx 200 ([ordered]@{ ok = $true; summary = $summary; chars = $rec.chars; model = [string]$cfg.model; total_ms = $sw.ElapsedMilliseconds })
+  return "call4 $($rec.chars)字「$summary」"
+}
+
 # ---------------------------------------------------------------- /log（客户端事件）
 function Invoke-ClientLog($ctx, $body) {
   $rec = [ordered]@{ type = 'client_event' }
@@ -949,6 +1232,8 @@ function Invoke-Request($ctx) {
     'POST /followup' { return (Invoke-Followup $ctx (Read-Body $ctx)) }
     'POST /log'     { return (Invoke-ClientLog $ctx (Read-Body $ctx)) }
     'POST /ocr'     { return (Invoke-OcrEndpoint $ctx (Read-Body $ctx)) }
+    'POST /asr'     { return (Invoke-AsrEndpoint $ctx (Read-Body $ctx)) }
+    'POST /summarize' { return (Invoke-SummarizeEndpoint $ctx (Read-Body $ctx)) }
     default {
       Send-Json $ctx 404 @{ error = "没有这个接口：$method $path" }
       return 'not found'
@@ -976,7 +1261,7 @@ if ($Port -le 0) { $Port = 8787 }
 $listener = Start-Listener $Port
 
 Write-Host ''
-Write-Host '  学习搭子 · 本地代理已启动' -ForegroundColor Green
+Write-Host "  学习搭子 v$VERSION · 本地代理已启动" -ForegroundColor Green
 Write-Host "  地址      http://localhost:$Port"
 Write-Host "  模型      $($cfg0.model)   视觉模型 $($cfg0.visionModel)"
 Write-Host "  上游      $($cfg0.baseUrl)"
@@ -987,6 +1272,14 @@ else {
   $ocr0 = Initialize-Ocr
   if ($ocr0.ok) { Write-Host "  画面识字  可用（Windows 本地识别，语言 $($ocr0.lang)）" }
   else { Write-Host ('  画面识字  不可用：' + $ocr0.error) -ForegroundColor Yellow }
+}
+if ($cfg0.asrEngine -eq 'off') { Write-Host '  语音识别  已关闭（config.json 里 asr.engine = "off"）' }
+else {
+  $asr0 = Initialize-Asr
+  $asrNote = if ($cfg0.asrEngine -eq 'cloud') { "云端 $([string](Get-Field $cfg0.asr 'model' ''))，失败时用本机；" } else { '' }
+  if ($asr0.ok) { Write-Host "  语音识别  可用（${asrNote}Windows 本机离线识别，语言 $($asr0.lang)）" }
+  elseif ($cfg0.asrEngine -eq 'cloud') { Write-Host ("  语音识别  云端 $([string](Get-Field $cfg0.asr 'model' ''))；本机识别不可用：" + $asr0.error) -ForegroundColor Yellow }
+  else { Write-Host ('  语音识别  不可用：' + $asr0.error) -ForegroundColor Yellow }
 }
 Write-Host "  提示词    $PromptDir（每次请求实时读取，改完不用重启）"
 Write-Host "  日志      $LogFile"

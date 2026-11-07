@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>设置页自测</title>
+<!--
+  设置页自测：用一个 chrome.* shim 加载真实的 extension/options.html + history.js + options.js。
+  python -m http.server 8790 --bind 127.0.0.1 后打开 http://localhost:8790/dev/options-page.html
+  - 存储：和 dev/test-page.html 共用 localStorage 里的 lb_harness_store，所以在模拟播放页上产生的历史这里也能看到；
+    地址加 ?seed=1 会再放进两个「B 站视频」的示例节点（BV 号 + 分P + 番剧），用来测跳转链接。
+  - 点节点：不会真的打开新标签页，而是把要打开的地址和 pendingRestore 显示在页面顶部。
+-->
+<style>
+  #shimbar { position: sticky; top: 0; z-index: 9; padding: 6px 12px; background: #222; color: #9fe; font: 12px/1.5 monospace; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="shimbar">shim：还没有打开过节点</div>
+<script>
+(() => {
+  const PERSIST_KEY = 'lb_harness_store';
+  let store = {};
+  try { store = JSON.parse(localStorage.getItem(PERSIST_KEY) || '{}') || {}; } catch (_) {}
+  const persist = () => { try { localStorage.setItem(PERSIST_KEY, JSON.stringify(store)); } catch (_) {} };
+  const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
+  const listeners = [];
+  const notify = (changes) => setTimeout(() => listeners.forEach((f) => f(changes, 'local')), 0);
+  const done = (cb, v) => { if (typeof cb === 'function') setTimeout(() => cb(v), 0); return Promise.resolve(v); };
+
+  if (new URLSearchParams(location.search).get('seed') === '1') {
+    const now = Date.now();
+    const node = (id, videoId, t, extra) => ({
+      id, videoId, subject: '', t, timestamp: `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(Math.floor(t % 60)).padStart(2, '0')}`,
+      createdAt: now - 3600e3 + t * 1000, updatedAt: now - 3600e3 + t * 1000, call2: { text: '示例解释' }, turns: [], rev: 1,
+      ruleSummary: '卡在「示例」', ...extra,
+    });
+    store['hist:BV1ys411472E_p3'] = { videoId: 'BV1ys411472E_p3', subject: '线性代数的本质 P3', updatedAt: now - 60e3, nodes: [
+      node('n-bv-1', 'BV1ys411472E_p3', 95, { summary: '矩阵乘法＝依次做两个线性变换', summarySource: 'ai', summaryRev: 1 }),
+      node('n-bv-2', 'BV1ys411472E_p3', 312, { turns: [{ q: '为什么顺序不能换', a: '先转再拉和先拉再转结果不同' }], rev: 2, ruleSummary: '卡在「顺序」 · 追问 1 次 · 还没懂' }),
+    ] };
+    store['hist:ep123456'] = { videoId: 'ep123456', subject: '某番剧课程', updatedAt: now - 7200e3, nodes: [node('n-ep-1', 'ep123456', 61, {})] };
+    persist();
+  }
+
+  window.chrome = {
+    runtime: {
+      getManifest: () => ({ version: window.__manifestVersion || '?' }),
+      sendMessage: (msg, cb) => done(cb, { ok: false, error: 'shim：设置页自测不连代理' }),
+      lastError: null,
+    },
+    tabs: {
+      create: ({ url }) => {
+        document.getElementById('shimbar').textContent = `shim：chrome.tabs.create → ${url}\npendingRestore = ${JSON.stringify(store.pendingRestore)}`;
+        window.__opened = url;
+      },
+    },
+    storage: {
+      onChanged: { addListener: (f) => listeners.push(f) },
+      local: {
+        get(keys, cb) {
+          let out = {};
+          if (keys == null) out = clone(store);
+          else if (typeof keys === 'string') { if (keys in store) out[keys] = clone(store[keys]); }
+          else if (Array.isArray(keys)) keys.forEach((k) => { if (k in store) out[k] = clone(store[k]); });
+          else Object.entries(keys).forEach(([k, d]) => { out[k] = k in store ? clone(store[k]) : d; });
+          return done(cb, out);
+        },
+        set(obj, cb) {
+          const changes = {};
+          for (const [k, v] of Object.entries(obj)) { changes[k] = { oldValue: store[k], newValue: clone(v) }; store[k] = clone(v); }
+          persist(); notify(changes);
+          return done(cb);
+        },
+        remove(keys, cb) {
+          const changes = {};
+          for (const k of [].concat(keys)) { if (k in store) { changes[k] = { oldValue: store[k] }; delete store[k]; } }
+          persist(); notify(changes);
+          return done(cb);
+        },
+        getBytesInUse(keys, cb) { return done(cb, JSON.stringify(store).length); },
+      },
+    },
+  };
+
+  const load = (src) => new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = resolve; s.onerror = () => reject(new Error('加载失败 ' + src));
+    document.body.append(s);
+  });
+
+  (async () => {
+    window.__manifestVersion = (await fetch('../extension/manifest.json').then((r) => r.json())).version;
+    const html = await fetch('../extension/options.html').then((r) => r.text());
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    doc.querySelectorAll('style').forEach((s) => document.head.append(s));
+    doc.querySelectorAll('body script').forEach((s) => s.remove());
+    document.body.append(...doc.body.childNodes);
+    await load('../extension/history.js');
+    await load('../extension/options.js');
+  })().catch((e) => { document.getElementById('shimbar').textContent = 'shim 出错：' + e.message; });
+})();
+</script>
+</body>
+</html>

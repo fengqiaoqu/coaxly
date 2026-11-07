@@ -8,5 +8,12 @@
   "ocr": true,
   "port": 8787,
   "httpProxy": "",
-  "timeoutSec": 60
+  "timeoutSec": 60,
+  "asr": {
+    "_说明": "语音追问的识别方式（v1.2）。engine：local＝Windows 自带离线中文识别（默认，不联网不花钱）；cloud＝OpenAI 兼容的 /audio/transcriptions，失败自动退回本机；off＝关闭。cloud 时 baseUrl / apiKey 留空就沿用上面的，model 必填（如 whisper-1）。",
+    "engine": "local",
+    "baseUrl": "",
+    "apiKey": "",
+    "model": ""
+  }
 }
