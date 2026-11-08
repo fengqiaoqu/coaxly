@@ -7,7 +7,7 @@
  */
 'use strict';
 
-importScripts('history.js');
+importScripts('compat.js', 'history.js');
 
 const DEFAULTS = { proxyUrl: 'http://localhost:8787', sendImage: true, summaryAi: true };
 const MAX_FRAME_WIDTH = 960;

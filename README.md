@@ -6,6 +6,8 @@
 
 实现依据：[提示词工程规格.md](提示词工程规格.md)（v1.2 的变化见 [docs/v1.2-规格变更.md](docs/v1.2-规格变更.md)，方案见 [docs/v1.2-方案.md](docs/v1.2-方案.md)；v1.3 方案见 [docs/v1.3-方案.md](docs/v1.3-方案.md)；v1.4 方案见 [docs/v1.4-记忆分层-方案.md](docs/v1.4-记忆分层-方案.md)）。
 
+> **macOS 用户**：本仓库已支持 macOS（Chrome + Safari）——双击 `启动.command` 启动代理，扩展加 `extension/compat.js` 兼容层即可在 Safari 用。部署与差异说明见 [README-macOS.md](README-macOS.md)。
+
 ```
 启动.bat                  双击启动本地代理
 proxy/server.ps1          本地代理（Windows 自带 PowerShell 即可运行，不用装任何东西）

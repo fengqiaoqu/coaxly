@@ -1,2 +1,9 @@
 proxy/config.json
 data/
+
+# macOS 适配：编译产物与系统文件（源码 proxy/mac/*.swift 入库，二进制用 build-mac.sh 生成）
+proxy/mac/lb-ocr
+proxy/mac/lb-asr
+__pycache__/
+*.pyc
+.DS_Store

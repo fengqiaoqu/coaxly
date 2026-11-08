@@ -27,7 +27,7 @@
 
 **必须用 `powershell.exe`（5.1）启动代理，不要用 `pwsh`（PowerShell 7）。** 7 也能跑起来，但「画面识字」（`Windows.Media.Ocr`）和「本机语音识别」（`System.Speech`）在 7 下不可用，`/health` 里会显示 `ocrReady: false` / `asrReady: false`。
 
-非 Windows 系统：不支持，告诉用户即可，不要尝试移植。
+非 Windows 系统：**macOS 已支持**——用 `python3 proxy/server.py`（或双击 `启动.command`）代替第 4 步的 PowerShell，OCR / 语音识别用系统自带框架，详见 [README-macOS.md](README-macOS.md)；其余平台仍不支持。
 
 ## 2. 获取代码
 
