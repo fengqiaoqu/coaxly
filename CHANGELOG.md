@@ -1,5 +1,29 @@
 # 版本记录
 
+## macOS 适配（基于 v1.3.0）· 2026-11-08
+
+在 Windows 版基础上新增 macOS 支持，**零新增依赖**（代理用系统 Python 3，OCR / ASR 用系统框架）。详细部署说明：[README-macOS.md](README-macOS.md)。Windows 版文件（`proxy/server.ps1`、`启动.bat`）原样保留，两个平台用同一套 `prompts/`、`proxy/config.json` 和 `data/calls.jsonl`。
+
+- **本地代理**：新增 `proxy/server.py`（Python 3 标准库），`proxy/server.ps1` 的完整移植——9 个端点（`/health` `/explain` `/route` `/followup` SSE 流式 `/log` `/ocr` `/asr` `/summarize` `/keypoints`）与请求 / 响应字段完全一致，扩展零改动即可连上；超长降温重试、视觉失败回落、Call 1 JSON 模式回退与 2-gram 兜底、Call 5 规则兜底、JSONL 日志等行为逐一对齐。`/health` 新增 `platform` 字段。
+- **画面识字**：新增 `proxy/mac/lb-ocr.swift`（macOS Vision 框架，zh-Hans，本机离线），对应 Windows 的 `Windows.Media.Ocr`；字幕带切分、乱码行过滤仍在代理里做，行为一致。
+- **语音识别**：新增 `proxy/mac/lb-asr.swift`——macOS 26+ 用 `SpeechTranscriber`（设备端离线、**不需要授权弹窗**），macOS 13–25 自动退回 `SFSpeechRecognizer`（首次使用需要一次「语音识别」授权）。云端 `/audio/transcriptions` 与 `asr.engine` 配置同 Windows。
+- **启动**：新增 `启动.command`（对应 `启动.bat`，双击在 Terminal 里启动代理）；`proxy/build-mac.sh` 一键编译两个 Swift CLI（只需 Xcode Command Line Tools）。
+- **Safari 支持**：扩展新增 `extension/compat.js`（Safari 的 Web Extension 用 `browser.*` 命名空间，统一映射到 `chrome.*`），接入 manifest、background 与设置页；扩展其余代码零改动。Chrome / Edge 不受影响。Safari 通过「设置 → 开发者 → 添加临时扩展」加载（Apple 限制：需本人触控 ID 确认，退出 Safari 或 24 小时后失效需重新添加）。
+- **自测工具**：新增 `dev/mock-upstream.py`（`dev/mock-upstream.js` 的 Python 移植，本机没有 Node 也能自测）；`.claude/launch.json` 增加 `mock-upstream-py`、`proxy-dev-mac` 启动项。
+- 没有改动 `prompts/*.md`、`提示词工程规格.md` 和任何 Windows 专用文件。
+
+### 验证（2026-11-08，macOS 26.3 / Chrome 143 / Safari 26.3）
+
+模拟上游 + 开发代理（8788）+ 模拟播放页：
+
+| 项 | 结果 |
+|---|---|
+| 9 个端点 | 全部通过；`/explain` 93 字 3 段、`/followup` SSE 首字 487ms、`/keypoints` AI 标注含核心级别 |
+| 特殊场景 | 超长降温重试（retried、更短采用）、追问离题拦截、上游不支持 JSON 模式回退、视觉模型失败回落纯文本 + 本地 OCR 补画面文字、Call 5 返回乱码走规则兜底——全部通过 |
+| 本机能力 | Vision OCR：中文字幕帧 ~0.5s 识别正确（底部居中行正确判为字幕）；SpeechTranscriber：7.3s 样例音频 →「线性无关到底是什么意思？能再举个例子吗？」1.7s，设备端免授权 |
+| 浏览器 | Chrome：模拟页全流程（播放→暂停→按 1→三段解释→追问流式）；真实扩展已加载，「测试连接」显示已连上代理。Safari（WebKit）：同一套模拟页全流程 + 截图确认抽屉排版正常 |
+| 未覆盖 | 真实 B 站页面 + 真实模型的端到端（需填 API Key 后由使用者验证）；Safari 临时扩展的加载因需本人触控 ID 未自动化，步骤已写入 README-macOS.md |
+
 ## v1.2（1.2.0）· 2026-11-07
 
 需求来源：知识库 `1107视频交互辅助学习/v1.2.md`（1 个 bug + 2 条建议）。实施方案：[docs/v1.2-方案.md](docs/v1.2-方案.md)；对提示词工程规格的影响：[docs/v1.2-规格变更.md](docs/v1.2-规格变更.md)。

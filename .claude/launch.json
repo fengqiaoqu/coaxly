@@ -14,9 +14,21 @@
       "port": 9901
     },
     {
+      "name": "mock-upstream-py",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["dev/mock-upstream.py", "9901"],
+      "port": 9901
+    },
+    {
       "name": "proxy-dev",
       "runtimeExecutable": "powershell.exe",
       "runtimeArgs": ["-NoProfile", "-File", "proxy/server.ps1", "-ConfigPath", "dev/mock-config.json", "-LogPath", "data/dev-calls.jsonl"],
+      "port": 8788
+    },
+    {
+      "name": "proxy-dev-mac",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["proxy/server.py", "--config", "dev/mock-config.json", "--port", "8788", "--log", "data/dev-calls.jsonl"],
       "port": 8788
     }
   ]
