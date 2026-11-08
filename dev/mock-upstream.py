@@ -14,13 +14,20 @@ dev/mock-upstream.js 的 Python 移植（本机没有 Node 也能自测）。用
   追问里含 "天气"/"游戏" → 路由判为 off_topic；含 "先修"/"高中" → related_general
   Call 4（system 里含「一句话说明」）→ 按追问里有没有「懂了」返回一句话说明
   Call 5（system 里含「标注课程重点」）→ 按关键词从字幕里挑重点，返回 JSON；字幕里含「乱码测试」→ 返回非 JSON
+  整片记忆（system 里含「分层记忆·小节」/「分层记忆·全片」）→ 按字幕原文拼出小节摘要 / 章节大纲（JSON）
   POST /v1/audio/transcriptions → 云端语音识别；model 含 "fail" 返回 500
+  GET /__last[?kind=call2|call1|call3|call4|call5|mem_map|mem_reduce] → 某一类调用最后一次的请求体
 """
 import json
+import math
 import re
 import sys
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+last = None
+last_by_kind = {}
 
 
 def text_of(content):
@@ -101,6 +108,56 @@ def summary(system):
     return '“线性无关”就是每个向量都带来一个新方向'
 
 
+# ---------------- 整片记忆（v1.4）：不懂内容，只按原文里出现的术语拼一个像样的摘要
+MEM_TERMS = ['极大线性无关组', '齐次线性方程组', '初等行变换', '线性无关', '线性相关', '线性组合', '张成', '零解', '共线', '共面', '秩']
+
+
+def _plain(t):
+    return re.sub(r'\[\d{1,3}:\d{2}\]\s*', '', re.sub(r'\s+', '', t))
+
+
+def mem_map(user):
+    chunks = []
+    for m in re.finditer(r'### 小节 (\d+) \[[^\]]*\]\n([\s\S]*?)(?=\n\n### 小节 |$)', user):
+        text = _plain(m.group(2))
+        terms = [t for t in MEM_TERMS if t in text
+                 and not any(u != t and u in text and t in u for u in MEM_TERMS)][:4]
+        title = (terms[0] if terms else text[:6])
+        if re.search(r'例|比如', text):
+            title += '的例子'
+        elif '定义' in text:
+            title += '的定义'
+        chunks.append({'i': int(m.group(1)), 'title': title[:12],
+                       'summary': '老师讲' + text[:40] + '…', 'terms': terms})
+    return {'chunks': chunks}
+
+
+def mem_reduce(user):
+    rows = []
+    for line in user.split('\n'):
+        m = re.match(r'^\[(\d+)\] \[[^\]]*\] ([^：]*)：?(.*)$', line)
+        if m:
+            rows.append({'i': int(m.group(1)),
+                         'title': (m.group(2).replace('（这一节没有摘要，原文开头）', '') or ('小节' + m.group(1))),
+                         'rest': m.group(3)})
+    n = len(rows)
+    k = n if n < 3 else min(10, max(3, math.ceil(n / 2)))
+    chapters = []
+    for c in range(k):
+        frm = (c * n) // k
+        to = ((c + 1) * n) // k - 1
+        chapters.append({'from': rows[frm]['i'], 'to': rows[to]['i'], 'title': rows[frm]['title'][:14]})
+    terms = []
+    for r in rows:
+        m = re.search(r'术语：([^）]*)', r['rest'])
+        for t in (m.group(1).split('、') if m else []):
+            if t and not any(x['term'] == t for x in terms) and len(terms) < 12:
+                terms.append({'term': t, 'def': t + '的人话定义（mock）', 'chunk': r['i']})
+    return {'topic': '向量组的线性相关性',
+            'summary': '从线性组合出发，' + '，然后'.join(c['title'] for c in chapters) + '。',
+            'chapters': chapters, 'terms': terms}
+
+
 class Mock(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -115,7 +172,14 @@ class Mock(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def do_GET(self):
+        if self.path.startswith('/__last'):
+            kind = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('kind', [None])[0]
+            return self.send_json(200, (last_by_kind.get(kind) if kind else last) or {})
+        return self.send_json(404, {'error': {'message': 'not found'}})
+
     def do_POST(self):
+        global last
         length = int(self.headers.get('Content-Length') or 0)
         body = self.rfile.read(length)
         if self.path.endswith('/audio/transcriptions'):
@@ -144,10 +208,16 @@ class Mock(BaseHTTPRequestHandler):
             kind = 'call1'
         elif '一句话说明' in system:
             kind = 'call4'
+        elif '分层记忆·小节' in system:
+            kind = 'mem_map'
+        elif '分层记忆·全片' in system:
+            kind = 'mem_reduce'
         elif req.get('stream'):
             kind = 'call3'
         else:
             kind = 'call2'
+        last = req
+        last_by_kind[kind] = req
         print('[mock] %s model=%s t=%s stream=%s json=%s image=%s auth=%s… unresolved=%s user=%s'
               % (kind, req.get('model'), req.get('temperature'), bool(req.get('stream')),
                  bool(req.get('response_format')), image, (self.headers.get('Authorization') or '')[:12],
@@ -167,11 +237,16 @@ class Mock(BaseHTTPRequestHandler):
             content = '“' + summary(system) + '”'
         elif kind == 'call5':
             content = keypoints(system)
+        elif kind == 'mem_map':
+            content = json.dumps(mem_map(user), ensure_ascii=False)
+        elif kind == 'mem_reduce':
+            content = json.dumps(mem_reduce(user), ensure_ascii=False)
         else:
             content = followup(user, system)
 
         if not req.get('stream'):
-            time.sleep({'call1': 0.12, 'call4': 0.12, 'call5': 0.4}.get(kind, 0.6))
+            time.sleep({'call1': 0.12, 'call4': 0.12, 'call5': 0.4,
+                        'mem_map': 0.9, 'mem_reduce': 0.9}.get(kind, 0.6))
             return self.send_json(200, {'id': 'mock', 'object': 'chat.completion',
                                         'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': content},
                                                      'finish_reason': 'stop'}]})

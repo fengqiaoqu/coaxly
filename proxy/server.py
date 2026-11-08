@@ -28,6 +28,7 @@
 
 import argparse
 import base64
+import hashlib
 import json
 import math
 import os
@@ -41,6 +42,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -54,7 +56,7 @@ ASR_BIN = os.path.join(MAC_DIR, 'lb-asr')
 LOG_FILE = os.path.join(DATA_DIR, 'calls.jsonl')
 CONFIG_PATH = os.path.join(PROXY_DIR, 'config.json')
 
-VERSION = '1.3.0'
+VERSION = '1.4.0'
 
 # ---------------------------------------------------------------- 文案常量
 T_UNKNOWN_SUBJECT = '未知课程'
@@ -815,6 +817,818 @@ def rule_keypoints(lines, frm, to, known, cap):
     return resolve_keypoints(cands, lines, frm, to, known, cap)
 
 
+# ---------------------------------------------------------------- 字幕记忆分层（v1.4）
+# 目标：AI 读完整部视频的全部字幕，既能模糊把握整体方向，又能精确把握暂停点前后那一段。
+#
+# 生成（扩展拿到整片字幕后 POST /memory/build，后台异步完成，结果存 data/memory/<视频>.json）：
+#   L0 原文层 cues    整片字幕逐句（扩展从 B 站字幕接口拉取；拉不到时用播放中边看边抓的字幕）
+#   L1 小节层 chunks  按时间切成 2–4 分钟的小节；map：一次读一批小节原文，每节写 ≤60 字摘要 + 术语
+#   L2 全局层 global  reduce：读全部小节摘要，写主题 + 主线 + 3–10 个章节 + 关键术语表
+#
+# 使用（每次 /explain、/followup 按暂停点 t 现场拼装，越往下越精确）：
+#   全局层  整片大纲，标出「用户现在在这一章」——只用来校准方向
+#   章节层  上一 / 当前 / 下一小节的摘要——这一段从哪来、往哪去
+#   焦点层  t-30 ~ t+30 秒原文，▶ 标出暂停那一句，分「已听过 / 还没看到」——解释对象
+#   回溯层  焦点里的术语在前文第一次出现的原文；追问时再按问题检索最相关的小节
+#
+# Windows 版由主事件循环每 250ms 步进异步 HttpClient 任务；macOS 版代理本身是多线程的，
+# 这里每个生成任务开一个后台线程（内部再按 parallel 并行 map 批次），对外行为一致：
+# 生成期间 /explain、/followup 照常响应，缺的层写「还在生成」。
+MEM_DIR = os.path.join(DATA_DIR, 'memory')
+MEM_VERSION = 1
+MEM_BATCH_CHARS = 6000   # map 一次最多读多少字
+MEM_BATCH_MAX = 8        # map 一次最多几个小节
+
+_mem_lock = threading.RLock()
+_mem_cache = {}   # video_id → 记忆对象（正在生成的也在这里，查询能看到进度）
+_mem_jobs = {}    # video_id → 生成任务
+_mem_index = {}   # 记忆 hash → 小节二字词索引（追问检索用）
+_mem_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='mem')
+
+
+def mem_settings(cfg):
+    s = {'enabled': True, 'chunkSec': 150.0, 'chunkChars': 900.0, 'focusBefore': 30.0, 'focusAfter': 30.0, 'parallel': 3}
+    m = cfg.get('memory')
+    if isinstance(m, dict):
+        for k in list(s):
+            if m.get(k) is not None:
+                s[k] = m[k]
+    s['enabled'] = s['enabled'] is not False
+    for k in ('chunkSec', 'chunkChars', 'focusBefore', 'focusAfter', 'parallel'):
+        s[k] = max(1.0, float(s[k]))
+    return s
+
+
+def short_hash(s):
+    return hashlib.sha1(str(s).encode('utf-8')).hexdigest()[:16]
+
+
+def mem_path(video_id):
+    safe = re.sub(r'[^A-Za-z0-9_\-]', '_', str(video_id))
+    if len(safe) > 80:
+        safe = safe[:60] + '_' + short_hash(video_id)
+    return os.path.join(MEM_DIR, safe + '.json')
+
+
+def to_mem_cues(raw):
+    """接受 [[from, to, text], ...]（扩展发的紧凑格式）或 B 站原始格式 [{from, to, content}]"""
+    items = []
+    for c in (raw or []):
+        if c is None:
+            continue
+        if isinstance(c, (list, tuple)):
+            if len(c) < 3:
+                continue
+            s, e, text = float(c[0]), float(c[1]), str(c[2])
+        elif isinstance(c, dict):
+            s = float(get_field(c, 'from', get_field(c, 's', 0)) or 0)
+            e = float(get_field(c, 'to', get_field(c, 'e', s)) or s)
+            text = str(get_field(c, 'content', get_field(c, 'text', '')) or '')
+        else:
+            continue
+        text = re.sub(r'\s+', ' ', text).strip()
+        if not text:
+            continue
+        if e < s:
+            e = s
+        items.append({'s': round(s, 2), 'e': round(e, 2), 'text': text})
+    items.sort(key=lambda c: c['s'])
+    out = []
+    for c in items:
+        if out:
+            p = out[-1]
+            if p['text'] == c['text'] and c['s'] - p['s'] < 6:  # 倒回重看时抓到两遍
+                if c['e'] > p['e']:
+                    p['e'] = c['e']
+                continue
+        out.append(c)
+    return out
+
+
+def chunk_text(cues, a, b):
+    """小节原文：每隔 30 秒插一个 [mm:ss]，让模型知道大概的时间位置，又不至于每句都带时间戳浪费字数"""
+    parts = []
+    next_mark = -1.0
+    for i in range(a, b + 1):
+        c = cues[i]
+        if c['s'] >= next_mark:
+            if parts:
+                parts.append('\n')
+            parts.append('[%s] ' % format_clock(c['s']))
+            next_mark = c['s'] + 30
+        else:
+            parts.append(' ')
+        parts.append(c['text'])
+    return ''.join(parts)
+
+
+def chunk_plain(cues, a, b):
+    return ' '.join(cues[i]['text'] for i in range(a, b + 1))
+
+
+def split_mem_chunks(cues, ms):
+    """切小节：到了目标时长 / 字数，就在下一个停顿或句末切开；最长不超过目标的 1.6 倍"""
+    n = len(cues)
+    ranges = []
+    a = 0
+    while a < n:
+        s0 = cues[a]['s']
+        chars = 0
+        b = a
+        for i in range(a, n):
+            b = i
+            chars += len(cues[i]['text'])
+            if i + 1 >= n:
+                break
+            dur = cues[i]['e'] - s0
+            gap = cues[i + 1]['s'] - cues[i]['e']
+            hard = dur >= ms['chunkSec'] * 1.6 or chars >= ms['chunkChars'] * 1.6
+            soft = ((dur >= ms['chunkSec'] or chars >= ms['chunkChars'])
+                    and (gap >= 0.6 or re.search(r'[。！？!?；;]$', cues[i]['text'])))
+            if hard or soft:
+                break
+        ranges.append((a, b))
+        a = b + 1
+    if len(ranges) >= 2:
+        last = ranges[-1]
+        chars = len(chunk_plain(cues, last[0], last[1]))
+        if cues[last[1]]['e'] - cues[last[0]]['s'] < ms['chunkSec'] * 0.4 and chars < ms['chunkChars'] * 0.4:
+            ranges[-2] = (ranges[-2][0], last[1])
+            ranges.pop()
+    out = []
+    for (a, b) in ranges:
+        plain = chunk_plain(cues, a, b)
+        out.append({
+            'i': len(out), 's': cues[a]['s'], 'e': cues[b]['e'], 'a': a, 'b': b,
+            'hash': short_hash(plain),
+            'title': limit_text(cues[a]['text'], 12),   # 规则兜底：模型摘要出来之前先用原文开头
+            'summary': limit_text(plain, 60),
+            'terms': [], 'src': 'rule',
+        })
+    return out
+
+
+def cues_hash(cues, ms):
+    sb = ''.join('%d|%s\n' % (int(c['s']), c['text']) for c in cues)
+    sb += 'chunk=%s/%s' % (ms['chunkSec'], ms['chunkChars'])
+    return short_hash(sb)
+
+
+def save_memory(mem):
+    os.makedirs(MEM_DIR, exist_ok=True)
+    with _mem_lock:
+        mem['updated'] = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+        with open(mem_path(mem['video_id']), 'w', encoding='utf-8') as f:
+            json.dump(mem, f, ensure_ascii=False, separators=(',', ':'))
+
+
+def get_memory(video_id):
+    if not video_id:
+        return None
+    with _mem_lock:
+        if video_id in _mem_cache:
+            return _mem_cache[video_id]
+    p = mem_path(video_id)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            m = json.load(f)
+    except ValueError:
+        return None
+    if int(get_field(m, 'version', 0) or 0) != MEM_VERSION:
+        return None
+    if m.get('status') == 'building':
+        m['status'] = 'partial'  # 上次没生成完代理就关了
+    with _mem_lock:
+        _mem_cache[video_id] = m
+    return m
+
+
+def parse_loose_json(text):
+    t = re.sub(r'<think>[\s\S]*?</think>', '', str(text or ''))
+    t = re.sub(r'```(?:json)?', '', t, flags=re.IGNORECASE).strip()
+    for pat in (r'^[\s\S]*$', r'\{[\s\S]*\}', r'\[[\s\S]*\]'):
+        m = re.match(pat, t)
+        if not m:
+            continue
+        try:
+            return json.loads(m.group(0))
+        except ValueError:
+            continue
+    return None
+
+
+# ---------------- 生成：map（小节摘要）→ reduce（全局）
+def map_batches(mem):
+    batches = []
+    cur, chars = [], 0
+    for c in mem['chunks']:
+        if c['src'] == 'llm':
+            continue  # 原文没变的小节沿用上次的摘要
+        ln = len(chunk_text(mem['cues'], c['a'], c['b']))
+        if cur and (chars + ln > MEM_BATCH_CHARS or len(cur) >= MEM_BATCH_MAX):
+            batches.append({'ids': cur, 'tries': 0})
+            cur, chars = [], 0
+        cur.append(int(c['i']))
+        chars += ln
+    if cur:
+        batches.append({'ids': cur, 'tries': 0})
+    return batches
+
+
+def format_chunk_digest(mem):
+    lines = []
+    for c in mem['chunks']:
+        head = '[%d] [%s-%s] ' % (c['i'], format_clock(c['s']), format_clock(c['e']))
+        if c['src'] == 'llm':
+            line = head + c['title'] + '：' + c['summary']
+            if c['terms']:
+                line += '（术语：%s）' % '、'.join(c['terms'])
+            lines.append(line)
+        else:
+            lines.append(head + '（这一节没有摘要，原文开头）' + c['summary'])
+    return '\n'.join(lines)
+
+
+def _mem_chat_call(job, kind, system, user, max_tokens):
+    """一次同步上游调用（整片字幕比即时解释慢得多，超时单独放宽）"""
+    cfg = job['cfg']
+    payload = {
+        'model': str(cfg['model']),
+        'messages': [
+            {'role': 'system', 'content': system},
+            {'role': 'user', 'content': user},
+        ],
+        'temperature': 0.2, 'max_tokens': max_tokens, 'stream': False,
+    }
+    if not job['no_json']:
+        payload['response_format'] = {'type': 'json_object'}
+    t0 = time.time()
+    url = str(cfg['baseUrl']).strip().rstrip('/') + '/chat/completions'
+    req = urllib.request.Request(url, method='POST', headers={
+        'Authorization': 'Bearer ' + str(cfg.get('apiKey') or '').strip(),
+        'Content-Type': 'application/json; charset=utf-8',
+    }, data=json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
+    timeout = max(180.0, float(cfg.get('timeoutSec') or 60))
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({'http': p, 'https': p} if (p := str(cfg.get('httpProxy') or '').strip()) else {}))
+    with _mem_lock:
+        job['calls'] += 1
+        job['json_mode'] = not job['no_json']
+    try:
+        resp = opener.open(req, timeout=timeout)
+        raw = resp.read().decode('utf-8', 'replace')
+    except urllib.error.HTTPError as e:
+        return {'ok': False, 'status': e.code, 'error': '上游返回 HTTP %d：%s' % (e.code, limit_text(e.read().decode('utf-8', 'replace'), 300)), 'ms': int((time.time() - t0) * 1000)}
+    except Exception as e:
+        msg = str(getattr(e, 'reason', None) or e)
+        timed_out = isinstance(e, TimeoutError) or (isinstance(e, urllib.error.URLError) and isinstance(getattr(e, 'reason', None), TimeoutError))
+        return {'ok': False, 'status': 0, 'error': ('上游超时' if timed_out else '请求上游失败：') + msg, 'ms': int((time.time() - t0) * 1000)}
+    try:
+        obj = json.loads(raw)
+        text = obj['choices'][0]['message']['content']
+    except Exception:
+        return {'ok': False, 'status': 200, 'error': '上游没有返回内容：' + limit_text(raw, 200), 'ms': int((time.time() - t0) * 1000)}
+    return {'ok': True, 'status': 200, 'text': str(text), 'ms': int((time.time() - t0) * 1000)}
+
+
+def _mem_call_payload(job, kind, batch):
+    mem = job['mem']
+    variables = {
+        'subject': str(mem.get('subject') or ''),
+        'desc': str(mem.get('desc') or '') or '（无）',
+        'duration': format_clock(mem['duration']),
+        'chunk_count': str(len(mem['chunks'])),
+    }
+    if kind == 'map':
+        system = fill_template(read_prompt('memory_map.md'), variables)
+        parts = []
+        for cid in batch['ids']:
+            c = mem['chunks'][cid]
+            parts.append('### 小节 %d [%s-%s]\n%s' % (cid, format_clock(c['s']), format_clock(c['e']),
+                                                      chunk_text(mem['cues'], c['a'], c['b'])))
+        return system, '\n\n'.join(parts), 200 + 260 * len(batch['ids'])
+    system = fill_template(read_prompt('memory_reduce.md'), variables)
+    return system, format_chunk_digest(mem), 2000
+
+
+def set_map_result(mem, ids, obj):
+    if obj is None:
+        return 0
+    items = obj if isinstance(obj, list) else (get_field(obj, 'chunks') or [])
+    applied = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            i = int(get_field(it, 'i', -1))
+        except (TypeError, ValueError):
+            continue
+        if i not in ids:
+            continue
+        summary = str(get_field(it, 'summary', '') or '').strip()
+        if not summary:
+            continue
+        title = str(get_field(it, 'title', '') or '').strip()
+        terms = [str(t).strip() for t in (get_field(it, 'terms') or []) if str(t).strip() and len(str(t).strip()) <= 16][:6]
+        c = mem['chunks'][i]
+        if title:
+            c['title'] = limit_text(title, 16)
+        c['summary'] = limit_text(summary, 90)
+        c['terms'] = terms
+        c['src'] = 'llm'
+        applied += 1
+    return applied
+
+
+def set_reduce_result(mem, obj):
+    if obj is None or isinstance(obj, list):
+        return False
+    chunks = mem['chunks']
+    n = len(chunks)
+    topic = str(get_field(obj, 'topic', '') or '').strip()
+    summary = str(get_field(obj, 'summary', '') or '').strip()
+    if not summary and not topic:
+        return False
+    # 章节：按 from 排序、去重叠、补空隙，保证按顺序覆盖全部小节
+    raw = []
+    for ch in (get_field(obj, 'chapters') or []):
+        if not isinstance(ch, dict):
+            continue
+        try:
+            f = int(get_field(ch, 'from', -1))
+            t = int(get_field(ch, 'to', -1))
+        except (TypeError, ValueError):
+            continue
+        if f < 0 or f >= n:
+            continue
+        if t < f:
+            t = f
+        if t >= n:
+            t = n - 1
+        raw.append({'from': f, 'to': t, 'title': str(get_field(ch, 'title', '') or '').strip()})
+    chapters = []
+    nxt = 0
+    for ch in sorted(raw, key=lambda x: x['from']):
+        if ch['to'] < nxt:
+            continue
+        title = limit_text(ch['title'], 18) if ch['title'] else str(chunks[nxt]['title'])
+        chapters.append({'from': nxt, 'to': ch['to'], 'title': title,
+                         's': chunks[nxt]['s'], 'e': chunks[ch['to']]['e']})
+        nxt = ch['to'] + 1
+    if nxt < n:
+        if chapters:
+            chapters[-1]['to'] = n - 1
+            chapters[-1]['e'] = chunks[n - 1]['e']
+        else:
+            chapters.append({'from': 0, 'to': n - 1,
+                             'title': limit_text(topic, 18) if topic else '全片',
+                             's': chunks[0]['s'], 'e': chunks[n - 1]['e']})
+    terms = []
+    seen = set()
+    for tm in (get_field(obj, 'terms') or []):
+        if not isinstance(tm, dict):
+            continue
+        term = str(get_field(tm, 'term', '') or '').strip()
+        if not term or len(term) > 16 or term in seen:
+            continue
+        seen.add(term)
+        try:
+            ci = int(get_field(tm, 'chunk', -1))
+        except (TypeError, ValueError):
+            ci = -1
+        terms.append({'term': term, 'def': limit_text(str(get_field(tm, 'def', '') or '').strip(), 30), 'chunk': ci})
+        if len(terms) >= 15:
+            break
+    mem['global'] = {'topic': limit_text(topic, 30), 'summary': limit_text(summary, 220),
+                     'chapters': chapters, 'terms': terms}
+    return True
+
+
+def _run_one_map(job, batch):
+    """跑一批 map（带 noJson 回退），返回是否成功处理"""
+    system, user, max_tokens = _mem_call_payload(job, 'map', batch)
+    res = _mem_chat_call(job, 'map', system, user, max_tokens)
+    if not res['ok'] and res['status'] >= 400 and res['status'] not in (401, 403, 429) and not job['no_json']:
+        with _mem_lock:
+            job['no_json'] = True  # 上游不支持 JSON 模式：去掉 response_format 重发
+        system, user, max_tokens = _mem_call_payload(job, 'map', batch)
+        res = _mem_chat_call(job, 'map', system, user, max_tokens)
+    return res
+
+
+def _memory_job_main(job):
+    mem = job['mem']
+    parallel = max(1, int(job['parallel']))
+    # ---- map 阶段：按 parallel 并行跑批次
+    while (job['queue'] or job['futures']) and job['phase'] == 'map':
+        while job['queue'] and len(job['futures']) < parallel:
+            batch = job['queue'].pop(0)
+            fut = _mem_pool.submit(_run_one_map, job, batch)
+            job['futures'].append((batch, fut))
+        # 等任意一个完成（轮询其它已完成的不阻塞）
+        done_now = [(b, f) for (b, f) in job['futures'] if f.done()]
+        if not done_now:
+            time.sleep(0.2)
+            continue
+        for batch, fut in done_now:
+            job['futures'].remove((batch, fut))
+            res = fut.result()
+            if job['phase'] != 'map':
+                continue
+            if not res['ok'] and res['status'] in (401, 403):
+                # Key 有问题，别的批次也不用试了
+                job['errors'].append(res['error'])
+                job['queue'] = []
+                job['phase'] = 'done'
+                continue
+            applied = 0
+            if res['ok']:
+                applied = set_map_result(mem, batch['ids'], parse_loose_json(res['text']))
+            if applied > 0:
+                job['done'] += 1
+                continue
+            batch['tries'] += 1
+            err = ('map 输出解析失败：' + limit_text(res['text'], 120)) if res['ok'] else str(res['error'])
+            if batch['tries'] < 2 and job['phase'] == 'map':
+                job['queue'].insert(0, batch)
+            else:
+                job['done'] += 1
+                job['failed'] += 1
+                job['errors'].append(err)
+        with _mem_lock:
+            mem['progress'] = {'phase': job['phase'], 'done': job['done'], 'total': job['total']}
+    if job['phase'] == 'map':
+        job['phase'] = 'reduce'
+    # ---- reduce 阶段：最多试 2 次
+    if job['phase'] == 'reduce':
+        while job['reduce_tries'] < 2 and job['phase'] == 'reduce':
+            system, user, max_tokens = _mem_call_payload(job, 'reduce', None)
+            res = _mem_chat_call(job, 'reduce', system, user, max_tokens)
+            if not res['ok'] and res['status'] >= 400 and res['status'] not in (401, 403, 429) and not job['no_json']:
+                with _mem_lock:
+                    job['no_json'] = True
+                system, user, max_tokens = _mem_call_payload(job, 'reduce', None)
+                res = _mem_chat_call(job, 'reduce', system, user, max_tokens)
+            ok = False
+            if res['ok']:
+                ok = set_reduce_result(mem, parse_loose_json(res['text']))
+            if ok:
+                job['phase'] = 'done'
+                break
+            job['reduce_tries'] += 1
+            job['errors'].append(('reduce 输出解析失败：' + limit_text(res['text'], 120)) if res['ok'] else str(res['error']))
+            if res['ok'] is False and res['status'] in (401, 403):
+                break
+        if job['phase'] == 'reduce':
+            job['phase'] = 'done'
+    with _mem_lock:
+        mem['progress'] = {'phase': job['phase'], 'done': job['done'], 'total': job['total']}
+
+
+def start_memory_job(mem, cfg):
+    queue = map_batches(mem)
+    job = {
+        'mem': mem, 'cfg': cfg, 'queue': queue, 'futures': [],
+        'phase': 'map', 'total': len(queue), 'done': 0, 'failed': 0, 'calls': 0,
+        'reduce_tries': 0, 'no_json': False, 'json_mode': None,
+        'parallel': int(mem_settings(cfg)['parallel']),
+        'errors': [], 't0': time.time(),
+    }
+    mem['model'] = str(cfg['model'])
+    mem['progress'] = {'phase': 'map', 'done': 0, 'total': len(queue)}
+    with _mem_lock:
+        _mem_jobs[str(mem['video_id'])] = job
+
+    def runner():
+        try:
+            _memory_job_main(job)
+        except Exception as e:
+            job['errors'].insert(0, '生成记忆时代理内部错误：%s' % e)
+            job['phase'] = 'done'
+        finally:
+            complete_memory_job(job)
+
+    threading.Thread(target=runner, daemon=True, name='mem-%s' % mem['video_id']).start()
+    return job
+
+
+def complete_memory_job(job):
+    mem = job['mem']
+    vid = str(mem['video_id'])
+    with _mem_lock:
+        if _mem_jobs.get(vid) is job:
+            _mem_jobs.pop(vid, None)
+        total = len(mem['chunks'])
+        llm = sum(1 for c in mem['chunks'] if c['src'] == 'llm')
+        if mem.get('global') and llm == total:
+            mem['status'] = 'ready'
+        elif mem.get('global') or llm > 0:
+            mem['status'] = 'partial'
+        else:
+            mem['status'] = 'raw'
+        mem['error'] = limit_text(str(job['errors'][0]), 300) if job['errors'] else None
+        mem['built_ms'] = int((time.time() - job['t0']) * 1000)
+        mem['progress'] = {'phase': 'done', 'done': job['done'], 'total': job['total']}
+        chapters = len(mem['global']['chapters']) if mem.get('global') else 0
+    save_memory(mem)
+    write_call_log({
+        'type': 'memory', 'video_id': vid, 'source': mem['source'], 'status': mem['status'],
+        'cues': len(mem['cues']), 'chunks': total, 'chunks_llm': llm, 'chapters': chapters,
+        'calls': job['calls'], 'failed': job['failed'], 'model': mem.get('model'),
+        'error': mem['error'], 'total_ms': mem['built_ms'],
+    })
+    print('[%s] 整片记忆 %s：%d 句 → %d 小节（模型摘要 %d）→ %d 章，调用 %d 次，%.1fs%s'
+          % (datetime.now().strftime('%H:%M:%S'), vid, len(mem['cues']), total, llm, chapters,
+             job['calls'], mem['built_ms'] / 1000, '  ' + limit_text(str(mem['error']), 80) if mem['error'] else ''),
+          flush=True)
+
+
+# ---------------- 使用：按暂停点拼装四层上下文
+def bigrams(s):
+    out = set()
+    for m in re.finditer(r'[一-鿿a-z0-9]+', str(s or '').lower()):
+        v = m.group(0)
+        for i in range(len(v) - 1):
+            out.add(v[i:i + 2])
+    return out
+
+
+def get_mem_index(mem):
+    key = str(mem.get('hash')) + '|' + str(mem.get('updated'))
+    with _mem_lock:
+        if key in _mem_index:
+            return _mem_index[key]
+    sets = []
+    df = {}
+    for c in mem['chunks']:
+        s = bigrams(chunk_plain(mem['cues'], c['a'], c['b']) + ' ' + c['title'] + ' ' + c['summary'])
+        sets.append(s)
+        for g in s:
+            df[g] = df.get(g, 0) + 1
+    with _mem_lock:
+        if len(_mem_index) > 20:
+            _mem_index.clear()
+        idx = {'sets': sets, 'df': df, 'n': len(sets)}
+        _mem_index[key] = idx
+    return idx
+
+
+def format_chunk_line(c, label):
+    head = '%s [%s-%s] ' % (label, format_clock(c['s']), format_clock(c['e']))
+    if c['src'] != 'llm':
+        return head + '（摘要还没生成，原文开头）' + c['summary']
+    line = head + c['title'] + '：' + c['summary']
+    if c['terms']:
+        line += '（术语：%s）' % '、'.join(c['terms'])
+    return line
+
+
+def cue_snippet(cues, k):
+    a = max(0, k - 1)
+    b = min(len(cues) - 1, k + 1)
+    return limit_text(chunk_plain(cues, a, b), 90)
+
+
+def memory_context(mem, t, question, ms):
+    cues = mem['cues']
+    n = len(cues)
+    chunks = mem['chunks']
+    g = mem.get('global')
+    lo = t - ms['focusBefore']
+    hi = t + ms['focusAfter']
+
+    # ---- 焦点层：t 前后原文，▶ 标出暂停那一句
+    cur = -1
+    for i in range(n):
+        if cues[i]['s'] <= t + 0.3:
+            cur = i
+        else:
+            break
+    pre, post = [], []
+    cur_line = None
+    focus_chars = 0
+    focus_text = []
+    focus_lo = n
+    for i in range(n):
+        c = cues[i]
+        if c['e'] < lo and i != cur:
+            continue
+        if c['s'] > hi:
+            break
+        if i < focus_lo:
+            focus_lo = i
+        line = '[%s] %s' % (format_clock(c['s']), c['text'])
+        focus_chars += len(c['text'])
+        focus_text.append(c['text'] + ' ')
+        if i < cur:
+            pre.append(line)
+        elif i == cur:
+            cur_line = '▶ %s　← 用户在 %s 暂停，这是暂停时正在播（或刚播完）的一句' % (line, format_clock(t))
+        else:
+            post.append(line)
+    fl = []
+    if pre:
+        fl.append('（暂停前，用户刚听过）')
+        fl.extend(pre)
+    if cur_line:
+        fl.append(cur_line)
+    if post:
+        fl.append('（暂停后，用户还没看到）')
+        fl.extend(post)
+    focus = '\n'.join(fl)
+
+    # ---- 暂停点落在哪个小节 / 哪一章
+    ci = 0
+    for c in chunks:
+        if c['s'] <= t:
+            ci = int(c['i'])
+        else:
+            break
+    cur_chapter = None
+    cur_chapter_no = 0
+
+    # ---- 全局层
+    gl, ol = [], []
+    if g:
+        if g.get('topic'):
+            gl.append('主题：%s' % g['topic'])
+        if g.get('summary'):
+            gl.append('主线：%s' % g['summary'])
+        gl.append('章节（全长 %s）：' % format_clock(mem['duration']))
+        k = 0
+        for ch in (g.get('chapters') or []):
+            k += 1
+            line = '  %d. [%s-%s] %s' % (k, format_clock(ch['s']), format_clock(ch['e']), ch['title'])
+            if ci >= int(ch['from']) and ci <= int(ch['to']):
+                line += '　← 用户现在在这一章'
+                cur_chapter = ch
+                cur_chapter_no = k
+            gl.append(line)
+            ol.append('[%s] %s' % (format_clock(ch['s']), ch['title']))
+        terms = [t for t in (g.get('terms') or []) if t and t.get('term')][:12]
+        if terms:
+            gl.append('关键术语：%s' % '；'.join(
+                ('%s（%s）' % (t['term'], t['def'])) if t.get('def') else str(t['term']) for t in terms))
+    else:
+        llm = [c for c in chunks if c['src'] == 'llm']
+        if llm:
+            gl.append('（整片总览还在生成，先给已读完的小节标题）')
+            for c in llm:
+                gl.append('  [%s] %s' % (format_clock(c['s']), c['title']))
+                ol.append('[%s] %s' % (format_clock(c['s']), c['title']))
+        else:
+            gl.append('（整片记忆还在生成，暂时只有暂停点附近的字幕）')
+
+    # ---- 章节层：上一 / 当前 / 下一小节
+    sl = []
+    if chunks:
+        if cur_chapter:
+            sl.append('所在章节：第 %d 章「%s」' % (cur_chapter_no, cur_chapter['title']))
+        if ci > 0:
+            sl.append(format_chunk_line(chunks[ci - 1], '上一小节'))
+        sl.append(format_chunk_line(chunks[ci], '▶ 当前小节'))
+        if ci + 1 < len(chunks):
+            sl.append(format_chunk_line(chunks[ci + 1], '下一小节'))
+
+    # ---- 回溯层 ①：焦点里出现的术语，在前文第一次出现的地方（老师常说「我们前面讲过的 X」）
+    rl = []
+    term_defs = {}
+    if g:
+        for tm in (g.get('terms') or []):
+            if tm and tm.get('term') and str(tm['term']) not in term_defs:
+                term_defs[str(tm['term'])] = str(tm.get('def') or '')
+    for c in chunks:
+        if c['src'] == 'llm':
+            for tm in c['terms']:
+                if tm and str(tm) not in term_defs:
+                    term_defs[str(tm)] = ''
+    probe = ''.join(focus_text) + ' ' + (question or '')
+    probe_l = probe.lower()
+    used_cues = set()
+    for term in sorted(term_defs.keys(), key=lambda x: -len(x)):
+        if len(rl) >= 2:
+            break
+        if len(term) < 2 or term.lower() not in probe_l:
+            continue
+        first = -1
+        for k in range(focus_lo):
+            if term.lower() in cues[k]['text'].lower():
+                first = k
+                break
+        if first < 0 or cues[first]['s'] >= lo - 5 or first in used_cues:
+            continue
+        used_cues.add(first)
+        line = '- 「%s」最早在 [%s] 出现：%s' % (term, format_clock(cues[first]['s']), cue_snippet(cues, first))
+        if term_defs[term]:
+            line += '（术语表：%s）' % term_defs[term]
+        rl.append(line)
+
+    # ---- 回溯层 ②：追问时按问题检索焦点之外最相关的小节（二字词 + 逆文档频率）
+    if question and question != T_DEFAULT_QUESTION and len(chunks) >= 2:
+        idx = get_mem_index(mem)
+        qg = bigrams(question)
+        best, best_score, best_hits = -1, 0.0, 0
+        for k, c in enumerate(chunks):
+            if c['e'] >= lo and c['s'] <= hi:
+                continue  # 和焦点重叠的小节已经在上面了
+            score, hits = 0.0, 0
+            for q in qg:
+                if q not in idx['sets'][k]:
+                    continue
+                df = idx['df'][q]
+                if df >= idx['n']:
+                    continue  # 每节都有的词没有区分度
+                score += math.log((idx['n'] + 1.0) / (df + 0.5))
+                hits += 1
+            if hits >= 2 and score > best_score:
+                best, best_score, best_hits = k, score, hits
+        if best >= 0:
+            c = chunks[best]
+            rl.append('- 和这次追问最相关的另一段：' + format_chunk_line(c, ''))
+            bk, bh = -1, 0
+            for k in range(int(c['a']), int(c['b']) + 1):
+                h = sum(1 for q in qg if q in cues[k]['text'].lower())
+                if h > bh:
+                    bh, bk = h, k
+            if bk >= 0:
+                rl.append('  原文 [%s]：%s' % (format_clock(cues[bk]['s']), cue_snippet(cues, bk)))
+
+    return {
+        'used': True,
+        'status': str(mem['status']),
+        'source': str(mem['source']),
+        'focus': focus,
+        'focus_chars': focus_chars,
+        'global_layer': limit_text('\n'.join(gl), 1600),
+        'section_layer': limit_text('\n'.join(sl), 700) if sl else '（无）',
+        'recall_layer': limit_text('\n'.join(rl), 600) if rl else '（无）',
+        'outline': limit_text(' / '.join(ol), 600) if ol else '（无）',
+        'chunk_index': ci,
+        'chapter': str(cur_chapter['title']) if cur_chapter else None,
+        'chapters': len(g.get('chapters') or []) if g else 0,
+        'recall_hits': len(rl),
+    }
+
+
+def memory_vars(cfg, video_id, t_sec, question, client_transcript=''):
+    """给 /explain、/followup、/route 用：没有记忆时各层填说明文字，保证提示词里不留 {{占位符}}"""
+    ms = mem_settings(cfg)
+    empty = {
+        'used': False, 'status': 'none', 'focus': None, 'focus_chars': 0, 'chapters': 0, 'recall_hits': 0,
+        'global_layer': '（没有整片字幕记忆，只拿到了暂停点附近的字幕）', 'section_layer': '（无）',
+        'recall_layer': '（无）', 'outline': '（无）',
+        'focus_before': str(int(ms['focusBefore'])), 'focus_after': str(int(ms['focusAfter'])),
+    }
+    if not ms['enabled'] or not video_id or t_sec is None or str(t_sec) == '':
+        return empty
+    try:
+        t = float(t_sec)
+    except (TypeError, ValueError):
+        return empty
+    mem = get_memory(video_id)
+    if not mem or not mem.get('cues'):
+        return empty
+    try:
+        r = memory_context(mem, t, question, ms)
+        r['focus_before'] = empty['focus_before']
+        r['focus_after'] = empty['focus_after']
+        # 防串台：客户端自己抓到的字幕和记忆里同一时间段的字幕几乎不重合（同一个编号换了视频、
+        # 开发自测页不同课程共用一个编号……），就不用这份记忆，免得把别的视频的内容拼进提示词
+        if client_transcript and r['focus_chars'] >= 10:
+            cg = bigrams(re.sub(r'\[\d{1,3}:\d{2}\]', '', client_transcript))
+            if len(cg) >= 12:
+                fg = bigrams(r['focus'])
+                hit = sum(1 for x in cg if x in fg)
+                if hit / len(cg) < 0.3:
+                    print('    整片记忆和这次的字幕对不上（重合 %d%%），这次不用记忆：%s'
+                          % (int(hit / len(cg) * 100), video_id), flush=True)
+                    empty['status'] = 'mismatch'
+                    return empty
+        return r
+    except Exception as e:
+        print('    拼装整片记忆失败：%s' % e, flush=True)
+        empty['status'] = 'error'
+        return empty
+
+
+def mem_status_obj(mem):
+    if not mem:
+        return {'status': 'none'}
+    chunks = mem.get('chunks') or []
+    g = mem.get('global')
+    return {
+        'status': str(mem.get('status')), 'source': str(mem.get('source')), 'hash': str(mem.get('hash')),
+        'cues': len(mem.get('cues') or []), 'chunks': len(chunks),
+        'chunks_llm': sum(1 for c in chunks if c.get('src') == 'llm'),
+        'chapters': len(g.get('chapters') or []) if g else 0,
+        'topic': str(g.get('topic')) if g else None,
+        'progress': mem.get('progress'), 'error': mem.get('error'),
+        'built_ms': mem.get('built_ms'), 'updated': mem.get('updated'),
+    }
+
+
 # ---------------------------------------------------------------- HTTP 基础设施
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -886,6 +1700,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split('?')[0].rstrip('/') or '/'
         if path in ('/', '/health'):
             return self.handle_health()
+        if path == '/memory/status':
+            return self.handle_memory_status()
         self.send_json(404, {'error': '没有这个接口：%s %s' % (self.command, path)})
         self.note('not found')
 
@@ -903,6 +1719,8 @@ class Handler(BaseHTTPRequestHandler):
             '/asr': self.handle_asr,
             '/summarize': self.handle_summarize,
             '/keypoints': self.handle_keypoints,
+            '/memory/build': self.handle_memory_build,
+            '/memory/context': self.handle_memory_context,
         }
         fn = table.get(path)
         if not fn:
@@ -958,7 +1776,8 @@ class Handler(BaseHTTPRequestHandler):
             'asrReady': bool(asr.get('ok')),
             'asrError': asr.get('error'),
             'asrModel': str(get_field(cfg.get('asr'), 'model', '') or '') if cfg.get('asrEngine') == 'cloud' else None,
-            'features': ['explain', 'route', 'followup', 'ocr', 'asr', 'summarize', 'keypoints'],
+            'features': ['explain', 'route', 'followup', 'ocr', 'asr', 'summarize', 'keypoints', 'memory'],
+            'memory': {'enabled': mem_settings(cfg)['enabled'], 'building': list(_mem_jobs.keys())},
             'prompts': files,
         })
         self.note('ok')
@@ -972,6 +1791,11 @@ class Handler(BaseHTTPRequestHandler):
             'transcript': str(get_field(body, 'transcript', '') or ''),
             'question': get_non_empty(body, 'question', ''),
         }
+        mem = memory_vars(cfg, str(get_field(body, 'video_id', '') or ''), get_field(body, 't_sec'),
+                          variables['question'], variables['transcript'])
+        variables['outline'] = mem['outline']
+        if mem['focus'] and mem['focus_chars'] >= transcript_body_length(variables['transcript']):
+            variables['transcript'] = mem['focus']
         meta = {'session_id': get_field(body, 'session_id'), 'video_id': get_field(body, 'video_id')}
         r = invoke_router(cfg, variables, meta)
         self.send_json(200, {'route': r['route'], 'redirect': r['redirect'], 'fallback': bool(r['fallback']),
@@ -1016,26 +1840,41 @@ class Handler(BaseHTTPRequestHandler):
         image = str(get_field(body, 'image', '') or '')
         want_image = image.startswith('data:image/') and not is_false(cfg.get('sendImage'))
 
+        # 整片记忆（v1.4）：有记忆时，焦点层从整片字幕里按暂停点重新截取——
+        # 包括用户还没播到的后 30 秒，并标出暂停那一句；另外拼上全局层、章节层、回溯层
+        mem = memory_vars(cfg, str(get_field(body, 'video_id', '') or ''), get_field(body, 't_sec'), question, transcript)
+        use_mem_focus = bool(mem['used'] and mem['focus'] and mem['focus_chars'] >= math.floor(0.8 * transcript_body_length(transcript)))
+        prompt_transcript = mem['focus'] if use_mem_focus else transcript
+
         # 模型不看图时，用本地文字识别读出画面上的字（含烧在画面里的硬字幕）
         frame_text = None
         if not want_image:
             frame_text = get_frame_text(cfg, image)
         if frame_text and frame_text.get('ok'):
             transcript = add_subtitle_to_transcript(transcript, timestamp, frame_text['subtitle'])
+            prompt_transcript = add_subtitle_to_transcript(prompt_transcript, timestamp, frame_text['subtitle'])
         screen_text = format_screen_text(frame_text)
         text_question = question + '\n\n' + screen_text if screen_text else question
 
-        degraded = transcript_body_length(transcript) < 10
+        if use_mem_focus:
+            degraded = transcript_body_length(transcript) < 10 and mem['focus_chars'] < 10
+        else:
+            degraded = transcript_body_length(prompt_transcript) < 10
         route = str(get_field(body, 'route', 'in_video') or 'in_video')
         if route not in ROUTES:
             route = 'in_video'
         variables = {
             'subject': get_non_empty(body, 'subject', T_UNKNOWN_SUBJECT),
             'timestamp': timestamp,
-            'transcript': transcript,
+            'transcript': prompt_transcript,
             'question': question,
             'past': format_past(get_field(body, 'past')),
             'route': route,
+            'global_layer': mem['global_layer'],
+            'section_layer': mem['section_layer'],
+            'recall_layer': mem['recall_layer'],
+            'focus_before': mem['focus_before'],
+            'focus_after': mem['focus_after'],
         }
         prompt_file = 'call2_degraded.md' if degraded else 'call2_explain.md'
         system = fill_template(read_prompt(prompt_file), variables)
@@ -1050,7 +1889,18 @@ class Handler(BaseHTTPRequestHandler):
             'ocr_subtitle': frame_text.get('subtitle') if frame_text else None,
             'ocr_ms': frame_text.get('ms') if frame_text else None,
             'ocr_error': frame_text.get('error') if frame_text else None,
+            't_sec': get_field(body, 't_sec'),
+            'memory_status': mem['status'],
+            'memory_focus': use_mem_focus,
+            'memory_chapter': mem.get('chapter'),
+            'memory_layer_chars': {'global': len(mem['global_layer']), 'section': len(mem['section_layer']),
+                                   'focus': len(prompt_transcript), 'recall': len(mem['recall_layer'])},
+            'recall_hits': mem['recall_hits'],
         }
+        if use_mem_focus:
+            rec['prompt_transcript'] = prompt_transcript
+        mem_info = {'used': bool(mem['used']), 'status': mem['status'], 'focus': use_mem_focus,
+                    'chapters': mem['chapters'], 'chapter': mem.get('chapter'), 'recall_hits': mem['recall_hits']}
 
         if not has_key(cfg):
             rec['error'] = 'no_api_key'
@@ -1107,13 +1957,15 @@ class Handler(BaseHTTPRequestHandler):
             'length_violation': violation, 'retried': retried, 'degraded': degraded,
             'frame_sent': want_image, 'vision_used': vision_used, 'ocr_used': bool(screen_text),
             'screen_text': screen_text, 'transcript': transcript, 'route': route,
-            'model': final_model, 'total_ms': total_ms,
+            'model': final_model, 'memory': mem_info, 'total_ms': total_ms,
         })
         flag = ' 超长!' if violation else ''
         deg = ' 降级' if degraded else ''
         ocr_flag = '' if not screen_text else (' 画面文字=%dms' % frame_text['ms'] if frame_text else ' 画面文字')
-        self.note('call2 %d字 段长[%s]%s%s 图=%s%s 重试=%s'
-                  % (final['chars'], ','.join(str(n) for n in final['seg_lengths']), flag, deg, vision_used, ocr_flag, retried))
+        mem_flag = (' 记忆=%s%s%s' % (mem['status'], '/' + mem['chapter'] if mem.get('chapter') else '',
+                                      ' 回溯%d' % mem['recall_hits'] if mem['recall_hits'] else '')) if mem['used'] else ''
+        self.note('call2 %d字 段长[%s]%s%s 图=%s%s 重试=%s%s'
+                  % (final['chars'], ','.join(str(n) for n in final['seg_lengths']), flag, deg, vision_used, ocr_flag, retried, mem_flag))
 
     # ---- /followup（Call 3，流式）
     def handle_followup(self, body):
@@ -1125,7 +1977,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.note('empty follow_up')
 
         transcript = str(get_field(body, 'transcript', '') or '')
-        degraded = transcript_body_length(transcript) < 10
+        # 整片记忆（v1.4）：追问时回溯层额外按「这句追问」检索焦点之外最相关的小节
+        mem = memory_vars(cfg, str(get_field(body, 'video_id', '') or ''), get_field(body, 't_sec'), follow_up, transcript)
+        use_mem_focus = bool(mem['used'] and mem['focus'] and mem['focus_chars'] >= math.floor(0.8 * transcript_body_length(transcript)))
+        if use_mem_focus:
+            transcript = mem['focus']
+        degraded = (mem['focus_chars'] < 10) if use_mem_focus else (transcript_body_length(transcript) < 10)
         meta = {'session_id': get_field(body, 'session_id'), 'video_id': get_field(body, 'video_id')}
         mode = 'socratic' if str(get_field(body, 'mode', 'direct')) == 'socratic' else 'direct'
         timestamp = get_non_empty(body, 'timestamp', '00:00')
@@ -1137,6 +1994,12 @@ class Handler(BaseHTTPRequestHandler):
             'type': 'call3', 'session_id': meta['session_id'], 'video_id': meta['video_id'],
             'timestamp': timestamp, 'follow_up': follow_up, 'mode': mode,
             'turn_index': get_field(body, 'turn_index'), 'degraded': degraded,
+            't_sec': get_field(body, 't_sec'),
+            'memory_status': mem['status'],
+            'memory_focus': use_mem_focus,
+            'memory_chapter': mem.get('chapter'),
+            'recall_hits': mem['recall_hits'],
+            'recall_layer': mem['recall_layer'] if mem['recall_hits'] else None,
         }
 
         self.start_sse()
@@ -1153,6 +2016,7 @@ class Handler(BaseHTTPRequestHandler):
                     route_info = invoke_router(cfg, {
                         'subject': get_non_empty(body, 'subject', T_UNKNOWN_SUBJECT),
                         'timestamp': timestamp, 'transcript': transcript, 'question': follow_up,
+                        'outline': mem['outline'],
                     }, meta)
                 route = route_info['route']
                 rec['routed_now'] = True
@@ -1180,6 +2044,11 @@ class Handler(BaseHTTPRequestHandler):
                 'follow_up': follow_up,
                 'history_summary': format_history(get_field(body, 'history')),
                 'transcript': T_NO_TRANSCRIPT if degraded else transcript,
+                'global_layer': mem['global_layer'],
+                'section_layer': mem['section_layer'],
+                'recall_layer': mem['recall_layer'],
+                'focus_before': mem['focus_before'],
+                'focus_after': mem['focus_after'],
             }
             system = fill_template(read_prompt('call3_followup.md'), variables)
             # 讲解时本地文字识别读出的画面文字，追问时也带上
@@ -1497,6 +2366,108 @@ class Handler(BaseHTTPRequestHandler):
         write_call_log(rec)
         self.send_json(200, {'ok': True})
         self.note('log %s' % rec.get('type'))
+
+    # ---- /memory/build（v1.4：整片字幕 → 后台生成分层记忆）
+    # 扩展拿到整片字幕后调用。立即返回，生成在后台线程进行。
+    # 同一份字幕（hash 相同）已生成好就直接返回；字幕变了（例如边看边抓的字幕变多了）只重做原文变了的小节。
+    def handle_memory_build(self, body):
+        cfg = get_config()
+        ms = mem_settings(cfg)
+        vid = str(get_field(body, 'video_id', '') or '')
+        if not vid:
+            self.send_json(400, {'error': 'video_id 不能为空'})
+            return self.note('memory build: no video_id')
+        if not ms['enabled']:
+            self.send_json(200, {'status': 'disabled'})
+            return self.note('memory disabled')
+        source = get_non_empty(body, 'source', 'bilibili')
+        cues = to_mem_cues(get_field(body, 'cues'))
+        if len(cues) < 5:
+            self.send_json(200, {'status': 'too_short', 'cues': len(cues)})
+            return self.note('memory too short (%d)' % len(cues))
+        h = cues_hash(cues, ms)
+        old = get_memory(vid)
+        force = get_field(body, 'force', False) is True
+
+        with _mem_lock:
+            job = _mem_jobs.get(vid)
+            if job and not force:
+                # 整片字幕优先于边看边抓：正在用边看边抓的字幕生成时，来了整片字幕就换掉
+                if not (job['mem'].get('source') == 'live' and source != 'live'):
+                    self.send_json(200, mem_status_obj(job['mem']))
+                    return self.note('memory %s 生成中 %d/%d' % (vid, job['done'], job['total']))
+            if old and old.get('source') != 'live' and source == 'live' and not force:
+                self.send_json(200, mem_status_obj(old))
+                return self.note('memory %s 已有整片字幕记忆，忽略边看边抓' % vid)
+            if old and old.get('hash') == h and not force and (old.get('status') == 'ready' or not has_key(cfg)):
+                self.send_json(200, mem_status_obj(old))
+                return self.note('memory %s 已就绪（%s）' % (vid, old.get('status')))
+
+        chunks = split_mem_chunks(cues, ms)
+        try:
+            dur = float(get_field(body, 'duration', 0) or 0)
+        except (TypeError, ValueError):
+            dur = 0.0
+        if dur <= 0:
+            dur = float(cues[-1]['e'])
+        mem = {
+            'version': MEM_VERSION, 'video_id': vid,
+            'subject': get_non_empty(body, 'subject', T_UNKNOWN_SUBJECT),
+            'desc': limit_text(str(get_field(body, 'desc', '') or ''), 300),
+            'source': source, 'lan': str(get_field(body, 'lan', '') or ''),
+            'hash': h, 'duration': dur, 'status': 'building',
+            'error': None, 'model': None, 'progress': None, 'built_ms': None, 'updated': None,
+            'global': None, 'chunks': chunks, 'cues': cues,
+        }
+        # 原文没变的小节沿用上次的摘要（小节按原文 hash 对应）
+        reused = 0
+        if old and not force:
+            by_hash = {str(c['hash']): c for c in old['chunks'] if c.get('src') == 'llm'}
+            for c in chunks:
+                o = by_hash.get(str(c['hash']))
+                if o:
+                    c['title'] = str(o['title'])
+                    c['summary'] = str(o['summary'])
+                    c['terms'] = list(o['terms'] or [])
+                    c['src'] = 'llm'
+                    reused += 1
+        with _mem_lock:
+            _mem_cache[vid] = mem
+        if not has_key(cfg):
+            # 没 Key 也能用：焦点层和回溯层不需要模型，只是没有摘要和大纲
+            mem['status'] = 'raw'
+            mem['error'] = 'no_api_key'
+            save_memory(mem)
+            self.send_json(200, mem_status_obj(mem))
+            return self.note('memory %s 没有 Key，只存原文 %d 句' % (vid, len(cues)))
+        job = start_memory_job(mem, cfg)
+        save_memory(mem)
+        self.send_json(200, mem_status_obj(mem))
+        self.note('memory %s 开始生成：%s %d 句 → %d 小节（沿用 %d），map %d 批'
+                  % (vid, source, len(cues), len(chunks), reused, job['total']))
+
+    # ---- /memory/status（GET ?video_id=）
+    def handle_memory_status(self):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        vid = (qs.get('video_id') or [''])[0]
+        self.send_json(200, mem_status_obj(get_memory(vid)))
+        self.note('quiet')
+
+    # ---- /memory/context（调试 / 演示：看某个时间点实际会拼给模型的四层上下文）
+    def handle_memory_context(self, body):
+        cfg = get_config()
+        vid = str(get_field(body, 'video_id', '') or '')
+        question = str(get_field(body, 'question', '') or '')
+        t0 = time.time()
+        r = memory_vars(cfg, vid, get_field(body, 't'), question, str(get_field(body, 'transcript', '') or ''))
+        self.send_json(200, {
+            'used': r['used'], 'status': r['status'], 'chapter': r.get('chapter'),
+            'chunk_index': r.get('chunk_index'),
+            'global_layer': r['global_layer'], 'section_layer': r['section_layer'],
+            'focus': r['focus'], 'recall_layer': r['recall_layer'], 'outline': r['outline'],
+            'ms': int((time.time() - t0) * 1000),
+        })
+        self.note('memory context %s t=%s 回溯=%s' % (vid, get_field(body, 't', '?'), r['recall_hits']))
 
 
 # ---------------------------------------------------------------- 启动
