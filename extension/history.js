@@ -1,6 +1,6 @@
-/* 学习搭子 · 历史节点存储（v1.2）
+/* 哄着学 Coaxly · 历史节点存储（v1.2）
  *
- * 用户每打开一次学习搭子并拿到解释，就是一个「节点」。节点存在 chrome.storage.local：
+ * 用户每打开一次哄着学并拿到解释，就是一个「节点」。节点存在 chrome.storage.local：
  *   hist:<视频ID> → { videoId, subject, updatedAt, nodes: [节点…] }
  * 只由扩展后台（background.js 通过 importScripts 加载本文件）写入，所有写操作排队执行，
  * 多个标签页同时追问也不会互相覆盖。设置页、模拟页也加载本文件，用来读取 / 清空。

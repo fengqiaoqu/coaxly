@@ -1,4 +1,4 @@
-/* 学习搭子 · service worker
+/* 哄着学 Coaxly · service worker
  * 1. 转发内容脚本到本地代理的请求（扩展只认代理地址，永远不接触 API Key）
  * 2. Call 3 的 SSE 流：chrome.runtime.connect({name:'stream'}) 长连接逐块转发
  * 3. 截图：captureVisibleTab → OffscreenCanvas 裁出视频矩形（绕开 B 站跨域视频污染画布的问题）

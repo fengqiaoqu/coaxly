@@ -94,6 +94,8 @@
     const doc = new DOMParser().parseFromString(html, 'text/html');
     doc.querySelectorAll('style').forEach((s) => document.head.append(s));
     doc.querySelectorAll('body script').forEach((s) => s.remove());
+    // 设置页里的相对路径（logo 等）按 extension/ 解析
+    doc.querySelectorAll('img[src]').forEach((i) => { i.src = new URL(i.getAttribute('src'), new URL('../extension/', location.href)).href; });
     document.body.append(...doc.body.childNodes);
     await load('../extension/history.js');
     await load('../extension/options.js');

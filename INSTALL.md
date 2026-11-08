@@ -34,8 +34,8 @@
 如果当前目录已经是本仓库（存在 `proxy/server.ps1` 和 `extension/manifest.json`），跳过这步。否则：
 
 ```bash
-git clone https://github.com/fengqiaoqu/learn-buddy.git
-cd learn-buddy
+git clone https://github.com/fengqiaoqu/coaxly.git
+cd coaxly
 ```
 
 **验证**：
@@ -95,7 +95,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File proxy\server.ps1
 正常启动时输出类似：
 
 ```
-  学习搭子 v1.4.0 · 本地代理已启动
+  哄着学 v1.4.1 · 本地代理已启动
   地址      http://localhost:8787
   模型      qwen-plus   视觉模型 qwen-vl-plus
   上游      https://dashscope.aliyuncs.com/compatible-mode/v1
@@ -124,8 +124,8 @@ curl -s http://localhost:8787/health
 | 字段 | 期望 | 不符合时 |
 |---|---|---|
 | `ok` | `true` | 请求失败 → 代理没起来，看启动窗口的报错 |
-| `name` | `learn-buddy-proxy` | 端口被别的程序占了，见第 9 节 |
-| `version` | `1.4.0`，与 `extension/manifest.json` 的 `version` 一致 | 用户开着旧版代理窗口：关掉重开 |
+| `name` | `coaxly-proxy` | 端口被别的程序占了，见第 9 节 |
+| `version` | `1.4.1`，与 `extension/manifest.json` 的 `version` 一致 | 用户开着旧版代理窗口：关掉重开 |
 | `features` | 包含 `keypoints`、`memory` | 同上：旧版代理没有课程重点 / 整片记忆接口 |
 | `hasKey` | `true` | 回到第 3 步；不影响启动 |
 | `prompts` | 包含 `call1_router.md` … `call5_keypoints.md`、`memory_map.md`、`memory_reduce.md` 共 11 个文件 | `prompts/` 目录缺文件，重新 `git checkout -- prompts` |
@@ -152,7 +152,7 @@ Chrome 不允许程序静默安装未上架的扩展，Agent 不要尝试改注�
 1. Chrome 地址栏打开 `chrome://extensions`（Edge 是 `edge://extensions`）。
 2. 打开右上角「开发者模式」。
 3. 点「加载已解压的扩展程序」，选择 `<项目绝对路径>\extension` 文件夹。
-4. 列表里出现「学习搭子 · B站视频即时解释」，版本 `1.4.0`。
+4. 列表里出现「哄着学 Coaxly · B站视频即时解释」（带蓝色气泡 logo），版本 `1.4.1`。
 5. 点浏览器工具栏上的扩展图标（可能在拼图图标里）→ 打开设置页 → 点「测试连接」，显示「已连上代理 · 模型 …」即成功。
 
 如果用户之前装过旧版：在 `chrome://extensions` 里点这个扩展的**刷新**按钮，然后刷新已打开的 B 站页面。
@@ -163,7 +163,7 @@ Chrome 不允许程序静默安装未上架的扩展，Agent 不要尝试改注�
 
 全部满足才算安装完成：
 
-- [ ] `/health` 返回 `ok: true`、`version: "1.4.0"`、`features` 含 `keypoints`、`memory`
+- [ ] `/health` 返回 `ok: true`、`version: "1.4.1"`、`features` 含 `keypoints`、`memory`
 - [ ] `hasKey: true`（或已明确告诉用户还需要填 Key、在哪填）
 - [ ] 用户确认扩展已加载，设置页「测试连接」成功
 - [ ] 已告诉用户：每次使用前先双击 `启动.bat`，窗口保持打开
@@ -197,7 +197,7 @@ python -m http.server 8790 --bind 127.0.0.1
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 启动报「无法监听端口 8787」 | 已经开着一个代理窗口，或端口被别的程序占用 | 先 `Invoke-RestMethod http://localhost:8787/health`：`name` 是 `learn-buddy-proxy` 说明代理已在跑，不用再启动（版本不对就让用户关掉旧窗口重开）；是别的程序就把 `config.json` 的 `port` 改成别的值，并让用户同步改扩展设置页的代理地址 |
+| 启动报「无法监听端口 8787」 | 已经开着一个代理窗口，或端口被别的程序占用 | 先 `Invoke-RestMethod http://localhost:8787/health`：`name` 是 `coaxly-proxy` 说明代理已在跑，不用再启动（版本不对就让用户关掉旧窗口重开）；是别的程序就把 `config.json` 的 `port` 改成别的值，并让用户同步改扩展设置页的代理地址 |
 | 启动报 `HttpListener` 拒绝访问 | 极少见，`localhost` 前缀需要权限 | 代理会自动退回只监听 `localhost`；仍失败就换一个端口 |
 | 运行脚本被执行策略拦截 | 系统禁止运行 `.ps1` | 命令里已带 `-ExecutionPolicy Bypass`（只对这次进程生效）。**不要**改系统级执行策略 |
 | 「config.json 不是合法 JSON」 | 手改时引号、逗号写错 | 修好 JSON；实在改坏了，备份后从 `config.example.json` 重新复制，再把用户的 Key 填回去 |

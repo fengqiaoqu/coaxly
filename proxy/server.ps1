@@ -1,5 +1,5 @@
 ﻿<#
-  学习搭子 · 本地代理（Windows PowerShell 5.1 / PowerShell 7 均可运行）
+  哄着学 Coaxly · 本地代理（Windows PowerShell 5.1 / PowerShell 7 均可运行）
 
   - 监听 http://localhost:<port>/（默认 8787）
   - 每次请求都实时读取 ../prompts/*.md，注入占位符后调用 OpenAI 兼容的 /chat/completions
@@ -48,7 +48,7 @@ if (-not (Test-Path $ConfigPath)) {
   if (Test-Path $example) { Copy-Item $example $ConfigPath }
 }
 
-$VERSION = '1.4.0'
+$VERSION = '1.4.1'
 
 # ---------------------------------------------------------------- 文案常量
 $T_UNKNOWN_SUBJECT  = '未知课程'
@@ -1243,7 +1243,7 @@ function Invoke-Health($ctx) {
   $files = @(Get-ChildItem -Path $PromptDir -Filter '*.md' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
   Send-Json $ctx 200 ([ordered]@{
       ok          = $true
-      name        = 'learn-buddy-proxy'
+      name        = 'coaxly-proxy'
       version     = $VERSION
       hasKey      = (Test-HasKey $cfg)
       baseUrl     = [string]$cfg.baseUrl
@@ -2349,7 +2349,7 @@ if ($Port -le 0) { $Port = 8787 }
 $listener = Start-Listener $Port
 
 Write-Host ''
-Write-Host "  学习搭子 v$VERSION · 本地代理已启动" -ForegroundColor Green
+Write-Host "  哄着学 v$VERSION · 本地代理已启动" -ForegroundColor Green
 Write-Host "  地址      http://localhost:$Port"
 Write-Host "  模型      $($cfg0.model)   视觉模型 $($cfg0.visionModel)"
 Write-Host "  上游      $($cfg0.baseUrl)"

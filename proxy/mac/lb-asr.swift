@@ -1,4 +1,4 @@
-// 学习搭子 · 语音识别（macOS）
+// 哄着学 Coaxly · 语音识别（macOS）
 // 本机中文识别，等价于 Windows 版的 System.Speech 离线识别。
 //
 // macOS 26+：用新的 SpeechTranscriber（SpeechAnalyzer 架构）：完全设备端离线，不需要任何授权弹窗。

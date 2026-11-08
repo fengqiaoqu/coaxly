@@ -1,5 +1,23 @@
 # 版本记录
 
+## v1.4.1 · 更名「哄着学 Coaxly」· 2026-11-08
+
+产品更名：中文名 **哄着学**，英文名 **Coaxly**（原「学习搭子 / LearnBuddy」），slogan **「别人卷你，我哄你。」**（README 顶部、设置页标题下、扩展简介、GitHub 仓库简介，抽屉标题栏悬停可见）。GitHub 仓库 `fengqiaoqu/learn-buddy` 同步改名为 `fengqiaoqu/coaxly`，旧地址自动跳转。功能、接口、提示词都没有变。
+
+- **Logo 进界面**：扩展有了自己的图标（工具栏、扩展管理页）；暂停时的「我这里不懂」按钮和抽屉标题栏带上 logo，标题栏显示「哄着学 Coaxly」；设置页标题和标签页图标同步。图标在 `extension/icons/`（由原 logo 抠出气泡图形，透明底，深浅色都能看清），README 用的完整 logo 在 `assets/logo.png`。
+- **配色**：界面主色是 logo 的长春花蓝，底色是书页奶油白，深色模式同步（`eb44905` 已合入，这里补记）。
+- **改名范围**：扩展名称「哄着学 Coaxly · B站视频即时解释」；代理启动横幅「哄着学 v1.4.1 · 本地代理已启动」；`/health` 的 `name` 改为 `coaxly-proxy`；`启动.bat` 窗口标题 `Coaxly Proxy`；README、INSTALL、macOS 说明和部署文档换成新名字和新仓库地址。
+- **保留原样的**：
+  - 提示词里「坐在用户旁边一起看视频的学习搭子」是给模型的角色描述，不是品牌名，`prompts/*.md` 和 `提示词工程规格.md` 不动。
+  - `LearnBuddy.exe` 是编译好的安装 / 托盘程序，源码不在仓库里，文件名和托盘里的「学习搭子」字样暂时保留；拿到源码重新编译时再改。
+  - `docs/` 里的旧版方案和本文件的历史条目保留原名。
+
+### 升级
+
+1. 关掉「启动.bat」的黑色窗口，重新双击打开（看到「哄着学 v1.4.1 · 本地代理已启动」）。
+2. `chrome://extensions` → 哄着学 → 点刷新按钮；刷新已经打开的 B 站页面。新图标如果被收进拼图菜单，点拼图把它固定出来。
+3. 已经 clone 过的仓库可以换成新地址（不换也能用，GitHub 会跳转）：`git remote set-url origin https://github.com/fengqiaoqu/coaxly.git`
+
 ## macOS 适配（基于 v1.4.0）· 2026-11-08
 
 在 Windows 版基础上新增 macOS 支持，**零新增依赖**（代理用系统 Python 3，OCR / ASR 用系统框架）。详细部署说明：[README-macOS.md](README-macOS.md)。Windows 版文件（`proxy/server.ps1`、`启动.bat`）原样保留，两个平台用同一套 `prompts/`、`proxy/config.json` 和 `data/calls.jsonl`。
