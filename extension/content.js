@@ -1,4 +1,4 @@
-/* 学习搭子 · 内容脚本（运行在 B 站页面里）
+/* 哄着学 Coaxly · 内容脚本（运行在 B 站页面里）
  *
  * 触发：视频暂停 → 画面中央出现「我这里不懂」按钮；或在任意时刻按 1。
  * 上下文：MutationObserver 监听播放器里 class 含 subtitle 的节点，按 video.currentTime 打点，
@@ -19,8 +19,8 @@
  */
 (() => {
   'use strict';
-  if (window.__learnBuddyLoaded) return;
-  window.__learnBuddyLoaded = true;
+  if (window.__coaxlyLoaded) return;
+  window.__coaxlyLoaded = true;
 
   // ------------------------------------------------------------------ 常量
   const DEFAULT_QUESTION = '这里没听懂，帮我讲讲刚才这一段';
@@ -1133,7 +1133,7 @@
     else if (waitingTrack) out.empty = '正在读取完整字幕…';
     else if (tr.status === 'ok') out.empty = k.spans.length ? '已经分析的部分没有找到明显的重点。' : started ? '正在读字幕找重点…' : '播放 10 秒后自动开始标注。';
     else if (state.subs.entries.length) out.empty = '还没攒够字幕。继续播放会边播边标；也可以点下面的【分析已播放部分】。';
-    else out.empty = '还没抓到字幕。打开播放器的字幕继续播放，学习搭子会边播边标出重点。';
+    else out.empty = '还没抓到字幕。打开播放器的字幕继续播放，重点会边播边标出来。';
     return out;
   }
 
@@ -1211,7 +1211,7 @@
       if (!layer || layer.parentNode !== bar) { // 第一次，或 B 站把进度条重绘掉了 → 补回来
         if (layer) layer.remove();
         layer = document.createElement('div');
-        layer.className = 'learn-buddy-kp';
+        layer.className = 'coaxly-kp';
         layer.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;z-index:2;';
         bar.appendChild(layer);
         kpBar.layers[kind] = layer;
@@ -1778,13 +1778,14 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 }
 .ask {
   display: flex; align-items: center; gap: 12px;
-  padding: 12px 14px 12px 24px; border-radius: 999px;
+  padding: 10px 14px 10px 14px; border-radius: 999px;
   border: 1px solid rgba(253, 249, 238, 0.18); background: rgba(27, 37, 64, 0.84); color: #fdf9ee;
   font: 500 17px/1.2 var(--serif); letter-spacing: 0.04em; white-space: nowrap;
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.32); backdrop-filter: blur(10px);
   transition: background .18s, border-color .18s;
 }
 .ask:hover { background: #4a6fb8; border-color: transparent; }
+.ask .logo { flex: none; width: 28px; height: 28px; margin: -2px -2px -2px 0; }
 .ask kbd {
   font: 500 12px/1 var(--mono); padding: 5px 8px; border-radius: 999px;
   background: rgba(253, 249, 238, 0.12); border: 1px solid rgba(253, 249, 238, 0.24);
@@ -1815,8 +1816,9 @@ button.chip:hover .dia { background: #fdf9ee; }
 
 .head { display: flex; align-items: center; gap: 6px; padding: 16px 12px 14px 20px; border-bottom: 1px solid var(--line); }
 .head-main { flex: 1; min-width: 0; }
-.brand { display: flex; align-items: center; gap: 9px; font: 600 17px/1.3 var(--serif); letter-spacing: 0.02em; }
-.brand .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--brand); }
+.brand { display: flex; align-items: center; gap: 8px; font: 600 17px/1.3 var(--serif); letter-spacing: 0.02em; }
+.brand .logo { flex: none; width: 26px; height: 26px; margin: -3px 2px -3px 0; }
+.brand .en { font: 500 11px/1 var(--sans); letter-spacing: 0.08em; color: var(--ink-3); }
 .brand .name { padding: 0 2px; background: linear-gradient(transparent 64%, var(--brand-soft) 64%, var(--brand-soft) 90%, transparent 90%); }
 .where { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 12px; color: var(--ink-3); min-width: 0; }
 .where .ts { flex: none; font: 500 12px/1.5 var(--mono); color: var(--accent); }
@@ -1999,11 +2001,14 @@ button.chip:hover .dia { background: #fdf9ee; }
 
   const MIC_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>';
   const SEND_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg>';
+  // 品牌 logo：扩展包里的 icons/logo-mark.png（manifest 里登记为 web_accessible_resources，B 站页面才能加载）
+  const LOGO_URL = (() => { try { return chrome.runtime.getURL('icons/logo-mark.png'); } catch (_) { return ''; } })();
+  const LOGO_IMG = LOGO_URL ? `<img class="logo" src="${LOGO_URL}" alt="" draggable="false">` : '';
   const CLOSE_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>';
 
   const HTML = `
 <div class="askwrap" hidden>
-  <button class="ask" type="button" aria-label="我这里不懂（快捷键 1）"><span>我这里不懂</span><kbd>1</kbd></button>
+  <button class="ask" type="button" aria-label="我这里不懂（快捷键 1）">${LOGO_IMG}<span>我这里不懂</span><kbd>1</kbd></button>
   <div class="askhint" hidden>
     <span class="chip nosub" hidden>这段没抓到字幕，解释可能不准</span>
     <button class="chip kpchip" type="button" hidden title="打开本视频的课程重点"><i class="dia"></i><span>附近重点</span><b></b></button>
@@ -2014,10 +2019,10 @@ button.chip:hover .dia { background: #fdf9ee; }
 <div class="subring" hidden><span>点这里打开字幕</span></div>
 <button class="kpcue" type="button" hidden title="打开本视频的课程重点"><i class="dia"></i><span class="lbl">重点</span><span class="ttl"></span></button>
 <div class="kptip" hidden></div>
-<aside class="drawer" hidden role="dialog" aria-label="学习搭子">
+<aside class="drawer" hidden role="dialog" aria-label="哄着学 Coaxly">
   <header class="head">
     <div class="head-main">
-      <div class="brand"><span class="dot"></span><span class="name">学习搭子</span></div>
+      <div class="brand" title="哄着学 Coaxly：别人卷你，我哄你。">${LOGO_IMG}<span class="name">哄着学</span><span class="en">Coaxly</span></div>
       <div class="where"><span class="ts"></span><span class="subject"></span></div>
     </div>
     <button class="hbtn kpbtn" type="button" title="课程重点：根据字幕判定的重点位置，点一条跳过去" aria-label="课程重点" aria-pressed="false">重点<span class="badge" hidden>0</span></button>
@@ -2064,7 +2069,7 @@ button.chip:hover .dia { background: #fdf9ee; }
 
   const ui = (() => {
     const host = document.createElement('div');
-    host.id = 'learn-buddy-root';
+    host.id = 'coaxly-root';
     host.style.cssText = 'all: initial; position: fixed; left: 0; top: 0; width: 0; height: 0; z-index: 2147483647;';
     const root = host.attachShadow({ mode: 'open' });
     root.innerHTML = `<style>${CSS}</style>${HTML}`;
@@ -2298,7 +2303,7 @@ button.chip:hover .dia { background: #fdf9ee; }
     const GUIDE_STEPS = {
       off: ['点下面的【一键打开字幕】（或播放器右下角「字幕」按钮，选中文）', '点【倒回 30 秒重看】，播到这里再暂停求助，就有前后文了'],
       need_login: ['先登录 B 站（页面右上角头像）', '在播放器右下角「字幕」里选中文（AI 生成的也可以）', '倒回 30 秒重看，播到这里再暂停求助'],
-      none: ['如果字幕是印在画面里的：保持「启动.bat」开着，先多播放十几秒再暂停，学习搭子会读画面上的字', '也可以在下面的追问里直接说你卡在哪句话'],
+      none: ['如果字幕是印在画面里的：保持「启动.bat」开着，先多播放十几秒再暂停，就能读到画面上的字', '也可以在下面的追问里直接说你卡在哪句话'],
       on: ['点【倒回 30 秒重看】，让这一段的字幕先播一遍', '播到这里再暂停求助'],
     };
     GUIDE_STEPS.no_button = GUIDE_STEPS.none;
@@ -2357,12 +2362,12 @@ button.chip:hover .dia { background: #fdf9ee; }
       toastVideo = v;
       subToast.textContent = '';
       const TEXT = {
-        off: '这个视频有字幕，只是没打开。打开后学习搭子才听得到老师在讲什么。',
+        off: '这个视频有字幕，只是没打开。打开后哄着学才听得到老师在讲什么。',
         need_login: 'B 站的 AI 字幕要登录后才能看。登录后在播放器右下角「字幕」里选中文。',
-        none: '这个视频暂时没有字幕。如果字幕是印在画面里的，保持「启动.bat」开着，学习搭子会读画面上的字。',
+        none: '这个视频暂时没有字幕。如果字幕是印在画面里的，保持「启动.bat」开着，就能读到画面上的字。',
       };
       TEXT.no_button = TEXT.none;
-      const title = h('b', null, '没检测到字幕，学习搭子的解释会不准');
+      const title = h('b', null, '没检测到字幕，哄着学的解释会不准');
       const body = h('div', null, TEXT[st] || TEXT.none);
       const acts = h('div', { class: 'acts' });
       if (st === 'off') {
@@ -2372,7 +2377,7 @@ button.chip:hover .dia { background: #fdf9ee; }
           clearTimeout(toastTimer);
           if (await guideOpenSubtitles('toast')) {
             title.textContent = '字幕已打开 ✓';
-            body.textContent = '接下来播放的内容学习搭子都能听到。';
+            body.textContent = '接下来播放的内容哄着学都能听到。';
             acts.remove();
             toastTimer = setTimeout(() => hideToast(), 3000);
           } else hideToast();

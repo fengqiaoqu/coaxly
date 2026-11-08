@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""学习搭子 · 本地代理（macOS 版，Python 3 标准库，无需安装任何依赖）
+"""哄着学 Coaxly · 本地代理（macOS 版，Python 3 标准库，无需安装任何依赖）
 
   proxy/server.ps1 的 macOS 移植，接口与字段完全一致（扩展无需改动即可连上）：
 
@@ -56,7 +56,7 @@ ASR_BIN = os.path.join(MAC_DIR, 'lb-asr')
 LOG_FILE = os.path.join(DATA_DIR, 'calls.jsonl')
 CONFIG_PATH = os.path.join(PROXY_DIR, 'config.json')
 
-VERSION = '1.4.0'
+VERSION = '1.4.1'
 
 # ---------------------------------------------------------------- 文案常量
 T_UNKNOWN_SUBJECT = '未知课程'
@@ -623,7 +623,7 @@ def cloud_asr(cfg, wav):
         return {'ok': False, 'error': 'config.json 里 asr.model 没填'}
     t0 = time.time()
     url = base.strip().rstrip('/') + '/audio/transcriptions'
-    boundary = '----LearnBuddyBoundary7MA4YWxkTrZu0gW'
+    boundary = '----CoaxlyBoundary7MA4YWxkTrZu0gW'
     parts = []
     for name, value in (('model', model), ('language', 'zh'), ('response_format', 'json')):
         parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary, name, value)).encode('utf-8'))
@@ -1632,7 +1632,7 @@ def mem_status_obj(mem):
 # ---------------------------------------------------------------- HTTP 基础设施
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
-    server_version = 'learn-buddy-proxy/' + VERSION
+    server_version = 'coaxly-proxy/' + VERSION
 
     # ---- 由 Router 注入的日志回调
     log_summary = None
@@ -1761,7 +1761,7 @@ class Handler(BaseHTTPRequestHandler):
         asr = init_asr() if asr_on else {'ok': False, 'error': None}
         self.send_json(200, {
             'ok': True,
-            'name': 'learn-buddy-proxy',
+            'name': 'coaxly-proxy',
             'version': VERSION,
             'platform': 'macOS',
             'hasKey': has_key(cfg),
@@ -2473,7 +2473,7 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------- 启动
 def banner(cfg, port):
     print()
-    print('  \033[32m学习搭子 v%s · 本地代理已启动（macOS）\033[0m' % VERSION)
+    print('  \033[32m哄着学 v%s · 本地代理已启动（macOS）\033[0m' % VERSION)
     print('  地址      http://localhost:%d' % port)
     print('  模型      %s   视觉模型 %s' % (cfg['model'], cfg['visionModel']))
     print('  上游      %s' % cfg['baseUrl'])
@@ -2532,7 +2532,7 @@ def run_server(port):
 
 def main():
     global LOG_FILE, CONFIG_PATH
-    ap = argparse.ArgumentParser(description='学习搭子本地代理（macOS）')
+    ap = argparse.ArgumentParser(description='哄着学 Coaxly 本地代理（macOS）')
     ap.add_argument('--config', default='', help='配置文件路径（默认 proxy/config.json）')
     ap.add_argument('--port', type=int, default=0, help='监听端口（默认取 config.json 的 port）')
     ap.add_argument('--log', default='', help='日志路径（开发自测时写到别处）')

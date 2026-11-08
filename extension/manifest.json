@@ -1,8 +1,15 @@
 {
   "manifest_version": 3,
-  "name": "学习搭子 · B站视频即时解释",
-  "version": "1.4.0",
-  "description": "看 B 站课程时暂停，点「我这里不懂」或按 1，右侧抽屉里给出 120 字以内的即时解释，可语音/文字追问；抓不到字幕时引导打开字幕；每次求助记成历史节点，可选节点回溯；读字幕自动标注课程重点，进度条上一眼看到、点一下跳过去。",
+  "name": "哄着学 Coaxly · B站视频即时解释",
+  "short_name": "哄着学",
+  "version": "1.4.1",
+  "description": "别人卷你，我哄你。看 B 站课程时暂停，点「我这里不懂」或按 1，右侧抽屉里给出 120 字以内的即时解释，可语音/文字追问；抓不到字幕时引导打开字幕；每次求助记成历史节点，可选节点回溯；读字幕自动标注课程重点，进度条上一眼看到、点一下跳过去。",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "permissions": ["storage"],
   "host_permissions": ["<all_urls>"],
   "background": {
@@ -15,11 +22,21 @@
       "run_at": "document_idle"
     }
   ],
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/logo-mark.png"],
+      "matches": ["*://www.bilibili.com/*"]
+    }
+  ],
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true
   },
   "action": {
-    "default_title": "学习搭子设置"
+    "default_title": "哄着学设置",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
   }
 }

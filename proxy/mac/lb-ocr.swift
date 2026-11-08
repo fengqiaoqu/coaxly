@@ -1,4 +1,4 @@
-// 学习搭子 · 画面识字（macOS）
+// 哄着学 Coaxly · 画面识字（macOS）
 // 用 macOS 自带的 Vision 框架做本地文字识别：不联网、不花钱、中文开箱即用。
 // 等价于 Windows 版的 Windows.Media.Ocr。
 //

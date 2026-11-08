@@ -1,5 +1,5 @@
 #!/bin/bash
-# 学习搭子 · macOS 启动脚本（对应 Windows 的 启动.bat）
+# 哄着学 Coaxly · macOS 启动脚本（对应 Windows 的 启动.bat）
 # 双击本文件：Terminal 里启动本地代理，窗口保持打开，关窗 = 停止代理。
 # 只用 macOS 自带的 Python 3，不需要安装任何依赖。
 cd "$(dirname "$0")"

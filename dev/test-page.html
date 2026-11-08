@@ -454,6 +454,7 @@ video.addEventListener('pause', () => (toggle.textContent = '播放'));
     lastError: undefined,
     sendMessage: (msg, cb) => { handle(msg).then((r) => cb && later(() => cb(r))); },
     connect: () => makePort(),
+    getURL: (p) => new URL('../extension/' + p, location.href).href,
   };
   const reply = (cb, value) => { if (cb) { later(() => cb(value)); return undefined; } return Promise.resolve(value); };
   const storage = {
