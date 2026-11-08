@@ -31,6 +31,8 @@
     ?track=1|bad|short|login|none  模拟字幕接口（默认 none）：
                    1 = 有完整字幕；bad = 返回别的视频的字幕（时长对得上，要靠播放时的字幕识破）；
                    short = 字幕太短（取回时就判为对不上）；login = 要登录才有字幕；none = 没有字幕
+    ?full=1        v1.4 整片记忆：换成 dev/sample-subtitles.json 那节约 8 分钟的课，并自动带上 ?bvid=BV1full&track=1，
+                   字幕走上面的仿 B 站接口 → 课程重点 + /memory/build
 -->
 <style>
   :root { --bg: #f4f5f7; --card: #fff; --ink: #18191c; --ink-2: #61666d; --line: #e3e5e7; }
@@ -143,8 +145,8 @@
 </main>
 
 <script>
-// ---------------------------------------------------------------- 模拟一节课（3 分钟）
-const LECTURE = [
+// ---------------------------------------------------------------- 模拟一节课（3 分钟；?full=1 换成 8 分钟的样例课）
+let LECTURE = [
   [0, '好，我们开始今天的内容'],
   [3, '上节课我们讲了向量的线性组合'],
   [7, '今天来看一个非常核心的概念'],
@@ -194,10 +196,30 @@ const OTHER = ['今天我们来做一道番茄炒蛋', '先把鸡蛋打散加一
 const video = document.getElementById('v');
 const sub = document.getElementById('sub');
 const params = new URLSearchParams(location.search);
+let DURATION = 184;
+
+// ---------------------------------------------------------------- v1.4 整片记忆（?full=1）
+// 同步读 sample-subtitles.json 换掉上面那节 3 分钟的课；补上 bvid / track=1，让 content.js 从下面的仿 B 站字幕接口读到整份字幕。
+// 要在 content.js 之前改好地址：它启动时就按地址算视频 ID。
+const FULL = params.get('full') === '1';
+if (FULL) {
+  try {
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'sample-subtitles.json', false);
+    xhr.send();
+    const body = JSON.parse(xhr.responseText).body || [];
+    LECTURE = body.map((c) => [c.from, c.content]);
+    const end = body.length ? body[body.length - 1].to : 60;
+    LECTURE.push([end, '']);
+    DURATION = Math.ceil(end) + 3;
+  } catch (e) { console.warn('[harness] 读 sample-subtitles.json 失败', e); }
+  if (!params.get('bvid')) params.set('bvid', 'BV1full');
+  if (!params.get('track')) params.set('track', '1');
+  history.replaceState(null, '', location.pathname + '?' + params.toString());
+}
 
 // ---------------------------------------------------------------- 可跳转的虚拟时钟（canvas 推流的 <video> 本身不能 seek）
 const RATE = Math.min(2, Math.max(0.25, Number(params.get('rate')) || 1));
-const DURATION = 184;
 const clock = { base: 0, startedAt: null };
 const vnow = () => (clock.startedAt == null ? clock.base : Math.min(DURATION, clock.base + (performance.now() - clock.startedAt) / 1000 * RATE));
 Object.defineProperty(video, 'currentTime', {
@@ -343,7 +365,7 @@ video.addEventListener('pause', () => (toggle.textContent = '播放'));
     if (!/api\.bilibili\.com|hdslb\.com/.test(url)) return realFetch(input, init);
     window.__trackCalls.push(url);
     if (/\/x\/web-interface\/view/.test(url)) {
-      return json({ code: 0, data: { bvid: params.get('bvid'), cid: 10001, duration: DURATION, pages: [{ page: 1, cid: 10001, duration: DURATION, part: '第3讲' }] } });
+      return json({ code: 0, data: { bvid: params.get('bvid'), cid: 10001, duration: DURATION, desc: FULL ? '开发自测：合成的线性代数课（线性相关与线性无关）' : '', pages: [{ page: 1, cid: 10001, duration: DURATION, part: '第3讲' }] } });
     }
     if (/\/x\/player\/(wbi\/)?v2/.test(url)) {
       const has = mode === '1' || mode === 'bad' || mode === 'short';

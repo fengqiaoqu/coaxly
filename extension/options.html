@@ -6,11 +6,11 @@
 <title>学习搭子设置</title>
 <style>
   :root {
-    --bg: #faf9f5; --bg-soft: #f0eee6; --surface: #ffffff;
-    --ink: #141413; --ink-2: #5e5d59; --ink-3: #87867f;
-    --line: #e6e3da; --line-strong: #d6d2c6;
-    --accent: #c96442; --accent-soft: #f5e7e0;
-    --ok: #4f6b3a; --err: #b53d33; --solid: #141413; --on-solid: #faf9f5;
+    --bg: #fcfbf7; --bg-soft: #eef2fa; --surface: #ffffff;
+    --ink: #1f2a44; --ink-2: #56607a; --ink-3: #7a849b;
+    --line: #e3e8f1; --line-strong: #cfd8e8;
+    --accent: #4a6fb8; --accent-soft: #e9effa;
+    --ok: #3f7a63; --err: #c0473b; --solid: #2f3f63; --on-solid: #ffffff;
     --serif: Georgia, "Noto Serif SC", "Source Han Serif SC", "Source Han Serif CN", "Songti SC", STSong, SimSun, serif;
     --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
     --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
@@ -18,11 +18,11 @@
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --bg: #262624; --bg-soft: #30302e; --surface: #1f1e1d;
-      --ink: #faf9f5; --ink-2: #c2c0b6; --ink-3: #9c9a92;
-      --line: #3a3a36; --line-strong: #4a4944;
-      --accent: #d97757; --accent-soft: #3b2a23;
-      --ok: #a5b98a; --err: #f0938a; --solid: #faf9f5; --on-solid: #141413;
+      --bg: #1b2030; --bg-soft: #252b3d; --surface: #161a27;
+      --ink: #eef2fa; --ink-2: #b9c2d6; --ink-3: #8c95ab;
+      --line: #2e3549; --line-strong: #3c445a;
+      --accent: #9ab8ea; --accent-soft: #263453;
+      --ok: #8cc5ad; --err: #f0968c; --solid: #eef2fa; --on-solid: #1b2030;
       color-scheme: dark;
     }
   }
@@ -48,7 +48,7 @@
   .seg label { padding: 4px 16px; border-radius: 999px; cursor: pointer; color: var(--ink-2); }
   .seg input { display: none; }
   .seg input:checked + span { color: var(--ink); font-weight: 600; }
-  .seg label:has(input:checked) { background: var(--surface); box-shadow: 0 1px 2px rgba(20,20,19,.12); }
+  .seg label:has(input:checked) { background: var(--surface); box-shadow: 0 1px 2px rgba(31,42,68,.12); }
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   button {
     padding: 7px 16px; border-radius: 999px; border: 1px solid var(--line-strong); background: transparent;
@@ -144,7 +144,7 @@
     </label>
     <label class="check">
       <input type="checkbox" id="kpTrack">
-      <span>读取完整字幕，提前标出全片重点<small>用你在 B 站的登录状态读取这个视频的 CC / AI 字幕（和播放器自己取字幕走同一个接口）。关掉或视频没有字幕时，只根据已经播放过的字幕边播边标。</small></span>
+      <span>读取完整字幕（课程重点和整片记忆都用）<small>用你在 B 站的登录状态读取这个视频的 CC / AI 字幕（和播放器自己取字幕走同一个接口）。有了完整字幕，能提前标出全片重点；求助时 AI 也读过整部视频（整片记忆），知道全片在讲什么、现在讲到哪一章。关掉或视频没有字幕时，只用已经播放过的字幕。</small></span>
     </label>
     <label class="check">
       <input type="checkbox" id="kpCue">

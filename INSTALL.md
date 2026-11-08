@@ -95,7 +95,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File proxy\server.ps1
 正常启动时输出类似：
 
 ```
-  学习搭子 v1.3.0 · 本地代理已启动
+  学习搭子 v1.4.0 · 本地代理已启动
   地址      http://localhost:8787
   模型      qwen-plus   视觉模型 qwen-vl-plus
   上游      https://dashscope.aliyuncs.com/compatible-mode/v1
@@ -125,10 +125,10 @@ curl -s http://localhost:8787/health
 |---|---|---|
 | `ok` | `true` | 请求失败 → 代理没起来，看启动窗口的报错 |
 | `name` | `learn-buddy-proxy` | 端口被别的程序占了，见第 9 节 |
-| `version` | `1.3.0`，与 `extension/manifest.json` 的 `version` 一致 | 用户开着旧版代理窗口：关掉重开 |
-| `features` | 包含 `keypoints` | 同上：旧版代理没有课程重点接口 |
+| `version` | `1.4.0`，与 `extension/manifest.json` 的 `version` 一致 | 用户开着旧版代理窗口：关掉重开 |
+| `features` | 包含 `keypoints`、`memory` | 同上：旧版代理没有课程重点 / 整片记忆接口 |
 | `hasKey` | `true` | 回到第 3 步；不影响启动 |
-| `prompts` | 包含 `call1_router.md` … `call5_keypoints.md` 共 9 个文件 | `prompts/` 目录缺文件，重新 `git checkout -- prompts` |
+| `prompts` | 包含 `call1_router.md` … `call5_keypoints.md`、`memory_map.md`、`memory_reduce.md` 共 11 个文件 | `prompts/` 目录缺文件，重新 `git checkout -- prompts` |
 | `ocrReady` | `true` | 看 `ocrError`；可选功能，见第 9 节 |
 | `asrReady` | `true` | 看 `asrError`；可选功能，见第 9 节 |
 
@@ -152,7 +152,7 @@ Chrome 不允许程序静默安装未上架的扩展，Agent 不要尝试改注�
 1. Chrome 地址栏打开 `chrome://extensions`（Edge 是 `edge://extensions`）。
 2. 打开右上角「开发者模式」。
 3. 点「加载已解压的扩展程序」，选择 `<项目绝对路径>\extension` 文件夹。
-4. 列表里出现「学习搭子 · B站视频即时解释」，版本 `1.3.0`。
+4. 列表里出现「学习搭子 · B站视频即时解释」，版本 `1.4.0`。
 5. 点浏览器工具栏上的扩展图标（可能在拼图图标里）→ 打开设置页 → 点「测试连接」，显示「已连上代理 · 模型 …」即成功。
 
 如果用户之前装过旧版：在 `chrome://extensions` 里点这个扩展的**刷新**按钮，然后刷新已打开的 B 站页面。
@@ -163,7 +163,7 @@ Chrome 不允许程序静默安装未上架的扩展，Agent 不要尝试改注�
 
 全部满足才算安装完成：
 
-- [ ] `/health` 返回 `ok: true`、`version: "1.3.0"`、`features` 含 `keypoints`
+- [ ] `/health` 返回 `ok: true`、`version: "1.4.0"`、`features` 含 `keypoints`、`memory`
 - [ ] `hasKey: true`（或已明确告诉用户还需要填 Key、在哪填）
 - [ ] 用户确认扩展已加载，设置页「测试连接」成功
 - [ ] 已告诉用户：每次使用前先双击 `启动.bat`，窗口保持打开

@@ -34,10 +34,10 @@ $('proxyUrl').addEventListener('change', (e) => {
 for (const id of ['sendImage', 'hardsub', 'voice', 'subGuide', 'summaryAi', 'keyPoints', 'kpTrack', 'kpCue']) {
   $(id).addEventListener('change', (e) => { save({ [id]: e.target.checked }); syncKpDeps(); });
 }
-// 总开关关掉时，两个子开关变灰（值保留）
+// 总开关关掉时，「经过重点时提示」变灰（值保留）；「读取完整字幕」整片记忆也要用（v1.4），不跟着变灰
 function syncKpDeps() {
   const on = $('keyPoints').checked;
-  for (const id of ['kpTrack', 'kpCue']) { $(id).disabled = !on; $(id).closest('label').style.opacity = on ? '' : '.5'; }
+  for (const id of ['kpCue']) { $(id).disabled = !on; $(id).closest('label').style.opacity = on ? '' : '.5'; }
 }
 for (const name of ['mode', 'voiceEngine']) {
   for (const r of document.querySelectorAll(`input[name="${name}"]`)) {

@@ -12,7 +12,8 @@ spoken or typed question.
 
 Decide ONE of:
 - "in_video": the question is about the current video segment, the
-  concept being explained, or a term just used.
+  concept being explained, a term just used, or something this video
+  covers in another chapter (see the outline, if one is given).
 - "related_general": the question is about the broader subject but not
   strictly anchored to this segment (e.g., a prerequisite concept).
 - "off_topic": the question has nothing to do with studying this
@@ -29,6 +30,7 @@ Output JSON only:
 【上下文】
 视频科目/标题：{{subject}}
 当前时间戳：{{timestamp}}
+整片章节大纲（没有整片记忆时为“（无）”）：{{outline}}
 前后30秒字幕：
 {{transcript}}
 
