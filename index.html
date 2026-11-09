@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>哄着学 Coaxly</title>
+<meta name="description" content="哄着学 Coaxly：看 B 站课程卡住时按一下暂停，马上得到 120 字以内的三段解释，还能接着追问。浏览器扩展 + 本机代理，Windows 与 macOS 可用。">
+<meta property="og:title" content="哄着学 Coaxly · 别人卷你，我哄你。">
+<meta property="og:description" content="看课卡住时按一下暂停。等你、懂你，讲明白就放你回去。">
+<meta property="og:image" content="assets/poster.jpg">
+<meta name="theme-color" content="#000000">
+<link rel="icon" href="assets/logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=Noto+Sans+SC:wght@300;400;600;700&display=swap">
+<link rel="stylesheet" href="styles.css">
+<script>document.documentElement.classList.add('js')</script>
+</head>
+<body>
+
+<header class="gnav" role="banner">
+  <nav class="gnav-inner" aria-label="全局导航">
+    <a class="gnav-brand" href="#top"><img src="assets/logo.png" alt="" width="20" height="20">哄着学 Coaxly</a>
+    <ul class="gnav-items">
+      <li><a href="#concept">理念</a></li>
+      <li><a href="#video">演示</a></li>
+      <li><a href="#try">试一试</a></li>
+      <li><a href="#map">卡点地图</a></li>
+      <li><a href="#trust">隐私</a></li>
+      <li><a href="#install">安装</a></li>
+    </ul>
+    <a class="gnav-github" href="https://github.com/fengqiaoqu/coaxly" target="_blank" rel="noopener">GitHub</a>
+    <button class="gnav-menu" type="button" aria-expanded="false" aria-controls="gnav-drawer" aria-label="打开菜单">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M4 8h16M4 16h16"/></svg>
+    </button>
+  </nav>
+  <div class="gnav-drawer" id="gnav-drawer" hidden>
+    <ul>
+      <li><a href="#concept">理念</a></li>
+      <li><a href="#video">演示</a></li>
+      <li><a href="#try">试一试</a></li>
+      <li><a href="#map">卡点地图</a></li>
+      <li><a href="#trust">隐私</a></li>
+      <li><a href="#install">安装</a></li>
+      <li><a href="https://github.com/fengqiaoqu/coaxly" target="_blank" rel="noopener">GitHub</a></li>
+    </ul>
+  </div>
+</header>
+
+<div class="subnav">
+  <div class="subnav-inner">
+    <a class="subnav-title" href="#top">哄着学</a>
+    <div class="subnav-right">
+      <ul class="subnav-links">
+        <li><a href="#problem" data-spy>为什么</a></li>
+        <li><a href="#video" data-spy>演示</a></li>
+        <li><a href="#try" data-spy>试一试</a></li>
+        <li><a href="#trust" data-spy>技术与隐私</a></li>
+      </ul>
+      <a class="btn btn-primary btn-sm" href="#install">免费安装</a>
+    </div>
+  </div>
+</div>
+
+<main id="top">
+
+  <!-- Hero -->
+  <section class="tile tile-light hero" aria-labelledby="hero-title">
+    <div class="tile-copy hero-in">
+      <img class="hero-logo" src="assets/logo.png" alt="哄着学 logo" width="88" height="88">
+      <h1 id="hero-title" class="tile-title tile-title-hero">别人卷你，我哄你。</h1>
+      <p class="tile-tagline">看课卡住时，按一下暂停。</p>
+      <p class="lead-airy">等你、懂你，讲明白就放你回去。哄着学陪你在 B 站看课：哪一秒没懂，就在那一秒给你一段不超过 120 字的解释。</p>
+      <div class="tile-actions">
+        <a class="btn btn-primary" href="#install">免费安装</a>
+        <a class="btn btn-secondary" href="#video">观看演示</a>
+      </div>
+    </div>
+
+    <div class="hero-scene" data-reveal>
+      <div class="hero-stage" id="hero-stage" aria-label="产品示意：暂停后出现「我这里不懂」，右侧给出三段解释">
+        <div class="player" aria-hidden="true">
+          <div class="board">
+            <div class="board-title">第 3 讲 · 向量组的线性相关性</div>
+            <div class="board-formula">k₁v₁ + k₂v₂ + k₃v₃ = 0</div>
+            <div class="board-note">只有零解 ⇔ 线性无关</div>
+          </div>
+          <div class="subtitle">……任何一个，都不能由另外两个线性表示</div>
+          <div class="paused-badge" id="hero-badge">‖ 已暂停</div>
+          <div class="ask-layer">
+            <span class="btn btn-primary ask-pill">我这里不懂 · 按 1</span>
+            <span class="ask-near">附近重点：线性无关的定义</span>
+          </div>
+          <div class="pbar">
+            <span class="pbar-btn"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4l13 8-13 8z"/></svg></span>
+            <div class="track">
+              <div class="track-fill" id="hero-fill" style="width:8.3%"></div>
+              <span class="kp" style="left:8.3%"></span><span class="kp" style="left:29.4%"></span><span class="kp" style="left:67.1%"></span>
+              <span class="track-head" id="hero-head" style="left:8.3%"></span>
+            </div>
+            <span class="ptime" id="hero-time">03:25 / 41:12</span>
+          </div>
+        </div>
+        <aside class="hero-drawer" aria-hidden="true">
+          <div class="hd-head"><span>讲解 · 03:25</span><span>直说</span></div>
+          <div class="hd-seg on"><b>01</b><div><strong>说人话</strong><p>一组向量里，谁都不能由其他几个「拼」出来，就叫线性无关。</p></div></div>
+          <div class="hd-seg on"><b>02</b><div><strong>打个比方</strong><p>红、黄、蓝调不出彼此；加进橙色，就不行了。</p></div></div>
+          <div class="hd-seg on"><b>03</b><div><strong>问你一句</strong><p>如果里面有零向量，还线性无关吗？</p></div></div>
+          <div class="hd-foot">65 字 · 3 段 · 整片记忆 · 第 1 章</div>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+  <!-- Problem -->
+  <section class="tile tile-dark on-dark" id="problem" aria-labelledby="problem-title">
+    <div class="tile-copy">
+      <p class="eyebrow" data-reveal>卡住了，问谁</p>
+      <h2 id="problem-title" class="tile-title" data-reveal>好课已经不稀缺，<br>稀缺的是卡住时可以问的人。</h2>
+      <div class="bignum" data-reveal><span data-count="2.3" data-decimals="1">2.3</span><small>亿</small></div>
+      <p class="bignum-cap" data-reveal>2025 年在 B 站学习专业知识的人 · 来源：B 站《2025 年环境、社会及管治报告》</p>
+    </div>
+    <div class="pain-grid">
+      <div class="pain" data-reveal style="--d:0ms"><h3>视频是单向的</h3><p>讲得再好，也不知道你停在了哪一秒。课堂上卡住可以举手，对着视频只能自己扛。</p></div>
+      <div class="pain" data-reveal style="--d:90ms"><h3>一处没懂，后面全是似懂非懂</h3><p>知识是连着的。一处没跟上，后面二十分钟都在硬撑。</p></div>
+      <div class="pain" data-reveal style="--d:180ms"><h3>越是独自学习，越没人可问</h3><p>县城的学生、下班后自学的人、一个人备考的人。</p></div>
+    </div>
+  </section>
+
+  <!-- Gap -->
+  <section class="tile tile-parchment" id="gap" aria-labelledby="gap-title">
+    <div class="tile-copy">
+      <p class="eyebrow" data-reveal>学习工具的第三种做法</p>
+      <h2 id="gap-title" class="tile-title" data-reveal>省流让人少看一点，<br>卷让人多熬一点。</h2>
+      <p class="tile-tagline" data-reveal>哄着学让人看懂一点。</p>
+      <div class="chips gap-switch" role="group" aria-label="对比三种学习工具" data-reveal>
+        <button class="chip" type="button" data-gap="sheng" aria-pressed="false">省流</button>
+        <button class="chip" type="button" data-gap="juan" aria-pressed="false">卷</button>
+        <button class="chip" type="button" data-gap="hong" aria-pressed="true">哄</button>
+      </div>
+    </div>
+    <div class="gap-panel" data-reveal aria-live="polite">
+      <div class="gap-word gap-swap" id="gap-word">哄</div>
+      <div class="gap-body gap-swap" id="gap-body">
+        <h3>陪你把卡住的 30 秒看懂</h3>
+        <p class="gap-tools">在那一秒出现 · 懂前后文 · 讲得短 · 不评判</p>
+        <p>这个位置还空着。讲完让你接着看，不把课讲浅，也不让你一个人硬扛。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Concept -->
+  <section class="tile tile-light" id="concept" aria-labelledby="concept-title">
+    <div class="tile-copy">
+      <p class="eyebrow" data-reveal>产品理念</p>
+      <h2 id="concept-title" class="tile-title" data-reveal>「哄」：等你，懂你，然后放手。</h2>
+    </div>
+    <div class="cards3">
+      <article class="card" data-reveal style="--d:0ms">
+        <p class="card-kicker">等你</p>
+        <h3>只在你暂停时出现</h3>
+        <p>不推送、不打卡、不排名。暂停或按 <kbd>1</kbd> 就能问，前后 30 秒的字幕和画面已经读好，你不用重新描述。</p>
+        <p class="card-gain">你得到：不被催</p>
+      </article>
+      <article class="card" data-reveal style="--d:90ms">
+        <p class="card-kicker">懂你</p>
+        <h3>先懂全片，再讲这一段</h3>
+        <p>先读完整部视频，知道你卡在哪一章。回答不超过 120 字，固定三段：说人话、打个比方、问你一句。</p>
+        <p class="card-gain">你得到：不被评判</p>
+      </article>
+      <article class="card" data-reveal style="--d:180ms">
+        <p class="card-kicker">放手</p>
+        <h3>讲明白就退场</h3>
+        <p>把你送回视频。想自己想通，就切到「带我想」：一次只问一个小问题。</p>
+        <p class="card-gain">你得到：掌控感</p>
+      </article>
+    </div>
+    <p class="quote-line" data-reveal>哄，不是把课讲浅，是不让你一个人硬扛。</p>
+  </section>
+
+  <!-- Video -->
+  <section class="tile tile-black on-dark" id="video" aria-labelledby="video-title">
+    <div class="tile-copy">
+      <p class="eyebrow" data-reveal>产品演示 · 1 分 37 秒</p>
+      <h2 id="video-title" class="tile-title" data-reveal>看它怎么哄你看懂。</h2>
+      <p class="lead-airy" data-reveal>真实录屏：B 站课程里暂停，点一下，三段解释；接着追问，回到卡住的那一刻。</p>
+    </div>
+    <div class="video-frame" id="video-frame">
+      <video id="demo-video" controls playsinline preload="metadata" poster="assets/poster.jpg">
+        <source src="assets/demo.mp4" type="video/mp4">
+        你的浏览器不支持视频播放，<a class="link" href="assets/demo.mp4">直接打开视频文件</a>。
+      </video>
+    </div>
+    <div class="chips chapters" id="chapters" role="group" aria-label="视频章节">
+      <button class="chip" type="button" data-t="16"><span class="chip-time">0:16</span>暂停，点一下</button>
+      <button class="chip" type="button" data-t="24.5"><span class="chip-time">0:24</span>三段式解释</button>
+      <button class="chip" type="button" data-t="35"><span class="chip-time">0:35</span>接着追问</button>
+      <button class="chip" type="button" data-t="49.5"><span class="chip-time">0:49</span>整片记忆</button>
+      <button class="chip" type="button" data-t="60"><span class="chip-time">1:00</span>学习历史</button>
+      <button class="chip" type="button" data-t="72"><span class="chip-time">1:12</span>课程重点</button>
+      <button class="chip" type="button" data-t="80.5"><span class="chip-time">1:20</span>数据留在本机</button>
+    </div>
+  </section>
+
+  <!-- Interactive demo -->
+  <section class="tile tile-light" id="try" aria-labelledby="try-title">
+    <div class="tile-copy">
+      <p class="eyebrow" data-reveal>试一试</p>
+      <h2 id="try-title" class="tile-title" data-reveal>暂停一下，三段话哄你看懂。</h2>
+      <p class="lead-airy" data-reveal>下面是一节模拟的线性代数课。点进度条上的菱形跳到课程重点，暂停后点「我这里不懂」，或者按 <kbd>1</kbd>。</p>
+    </div>
+
+    <div class="demo" data-reveal>
+      <div>
+        <div class="player" id="sim" tabindex="0" role="region" aria-label="模拟播放器。空格播放或暂停，按 1 求助。">
+          <div class="board">
+            <div class="board-title" id="sim-btitle">第 3 讲 · 向量组的线性相关性</div>
+            <div class="board-formula" id="sim-formula">k₁v₁ + k₂v₂ + k₃v₃ = 0</div>
+            <div class="board-note" id="sim-note">只有零解 ⇔ 线性无关</div>
+          </div>
+          <div class="subtitle" id="sim-sub">……任何一个，都不能由另外两个线性表示</div>
+          <div class="paused-badge" id="sim-badge">‖ 已暂停</div>
+          <div class="toast" id="sim-toast" role="status"></div>
+          <div class="ask-layer" id="sim-ask">
+            <button class="btn btn-primary" type="button" id="sim-askbtn">我这里不懂 · 按 1</button>
+            <span class="ask-near" id="sim-near">附近重点：线性无关的定义</span>
+          </div>
+          <div class="pbar">
+            <button class="pbar-btn" type="button" id="sim-play" aria-label="播放">
+              <svg id="ico-play" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4l13 8-13 8z"/></svg>
+              <svg id="ico-pause" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" hidden><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>
+            </button>
+            <div class="track" id="sim-track" aria-label="进度条">
+              <div class="track-fill" id="sim-fill"></div>
+              <span class="track-head" id="sim-head"></span>
+            </div>
+            <span class="ptime" id="sim-time">03:25 / 41:12</span>
+          </div>
+        </div>
+        <p class="demo-hint">快捷键：<kbd>空格</kbd> 播放 / 暂停（先点一下播放器），<kbd>1</kbd> 我这里不懂，<kbd>Esc</kbd> 关闭讲解。界面为示意，按 v1.4 的真实流程还原。</p>
+      </div>
+
+      <aside class="drawer" id="drawer" aria-label="讲解抽屉" aria-live="polite">
+        <div class="drawer-head">
+          <p class="drawer-title">讲解 <span id="dr-time"></span></p>
+          <div class="seg-toggle" role="group" aria-label="追问模式">
+            <button type="button" data-mode="direct" aria-pressed="true">直说</button>
+            <button type="button" data-mode="socratic" aria-pressed="false">带我想</button>
+          </div>
+        </div>
+        <div id="dr-body">
+          <p class="drawer-empty">视频已经停在 <strong>03:25</strong>。点播放器上的「我这里不懂」，解释会出现在这里：<strong>说人话、打个比方、问你一句</strong>，一共不超过 120 字。</p>
+        </div>
+        <p class="drawer-meta" id="dr-meta" hidden></p>
+        <div class="followups" id="dr-follow" hidden>
+          <div class="chips" role="group" aria-label="快捷追问">
+            <button class="chip" type="button" data-fu="again">还是不懂</button>
+            <button class="chip" type="button" data-fu="more">展开讲讲</button>
+            <button class="chip" type="button" data-fu="general">不管视频，直接讲</button>
+            <button class="chip" type="button" data-fu="got">懂了</button>
+          </div>
+          <div class="drawer-actions">
+            <button class="btn btn-primary btn-sm" type="button" id="dr-resume">继续播放</button>
+            <span class="drawer-meta" id="dr-hist">历史 0</span>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- Stuck map -->
+  <section class="tile tile-dark on-dark" id="map" aria-labelledby="map-title">
+    <div class="tile-copy">
+      <p class="eyebrow" data-reveal>卡点地图</p>
+      <h2 id="map-title" class="tile-title" data-reveal>每一个「不懂」，<br>都会成为一个坐标。</h2>
+    </div>
+    <div class="map-grid">
+      <div class="map-col" data-reveal>
+        <h3>复盘地图<span class="tag">v1.2 已实现</span></h3>
+        <p>每次求助记成一个节点：视频位置、当时的解释和全部追问。点一下，视频跳回那一秒，对话原样还原，可以接着问。</p>
+        <ul class="nodes" id="nodes">
+          <li class="node">
+            <button type="button" aria-expanded="false" aria-controls="nd1"><span class="node-t">03:25</span><span class="node-s">线性无关：谁都拼不出别人，追问后已懂<small>11-07 14:32 · 追问 1 轮</small></span><span class="node-x" aria-hidden="true">›</span></button>
+            <div class="node-detail" id="nd1" hidden>说人话：谁都不能由其他几个「拼」出来。追问：「含零向量为什么一定相关？」回答：给零向量系数 1，其余取 0，就是一组非零解。</div>
+          </li>
+          <li class="node">
+            <button type="button" aria-expanded="false" aria-controls="nd2"><span class="node-t">12:08</span><span class="node-s">秩：仍卡在「行秩为什么等于列秩」<small>追问 3 轮</small></span><span class="node-x" aria-hidden="true">›</span></button>
+            <div class="node-detail" id="nd2" hidden>已切到「带我想」。下一个小问题：把矩阵化成阶梯形，非零行有几行？主元所在的列又有几列？</div>
+          </li>
+          <li class="node">
+            <button type="button" aria-expanded="false" aria-controls="nd3"><span class="node-t">27:40</span><span class="node-s">基：坐标系里最少的那几个「零件」<small>无追问</small></span><span class="node-x" aria-hidden="true">›</span></button>
+            <div class="node-detail" id="nd3" hidden>看完解释直接回到视频，没有追问。这就是我们想要的结果：讲明白了，就放你走。</div>
+          </li>
+        </ul>
+      </div>
+      <div class="map-col" data-reveal style="--d:120ms">
+        <h3>困惑热力图<span class="tag">规划中</span></h3>
+        <p>把很多人的卡点叠在一起，看见哪一分钟让人卡住。平台给创作者的是播放量和完播率，我们给「困惑率」。</p>
+        <div class="heat" id="heat" role="group" aria-label="困惑热力图示意，每格一分钟"></div>
+        <div class="heat-axis"><span>00:00</span><span>20:00</span><span>41:12</span></div>
+        <p class="heat-readout" id="heat-readout">点一格，看那一分钟有多少人卡住。</p>
+        <p class="heat-legend">少 <i style="background:rgba(255,255,255,.08)"></i><i style="background:rgba(255,255,255,.35)"></i><i style="background:rgba(255,255,255,.65)"></i><i style="background:rgba(255,255,255,.95)"></i> 多 · 示意数据，可视化尚未开发</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- North star -->
+  <section class="tile tile-parchment" id="northstar" aria-labelledby="ns-title">
+    <div class="tile-copy">
+      <p class="eyebrow" data-reveal>北极星</p>
+      <h2 id="ns-title" class="tile-title" data-reveal>我们最看重的，<br>是你多快离开我们。</h2>
+      <p class="lead-airy" data-reveal>大多数 App 的北极星是使用时长，越久越好。我们反过来：看完一次解释、没有追问就回到视频，说明那 120 字真的让你看懂了。</p>
+    </div>
+    <div class="ns-wrap">
+      <div class="ns-main" data-reveal>
+        <p class="ns-label">北极星指标</p>
+        <h3>看完就关率</h3>
+        <p>看完解释、不追问、直接回到视频的比例。我们不和视频抢你的时间。</p>
+        <div class="ns-flow" aria-label="一次理想的求助"><span>暂停</span><i>›</i><span>读 120 字</span><i>›</i><span>懂了</span><i>›</i><span>回到视频</span></div>
+      </div>
+      <div class="ns-side">
+        <div class="ns-metric" data-reveal style="--d:80ms"><h4>长度违规率</h4><p>解释超过 120 字的比例。</p></div>
+        <div class="ns-metric" data-reveal style="--d:160ms"><h4>首字延迟</h4><p>从求助到看见第一个字的时间。</p></div>
+        <div class="ns-metric" data-reveal style="--d:240ms"><h4>卡点已懂率</h4><p>卡点最终被标为「已懂」的比例。</p></div>
+      </div>
+    </div>
+    <p class="fine" style="margin-top:24px" data-reveal>这些指标在 v1.2 中已全部写进本机日志 <code>data/calls.jsonl</code>，每次调用都可审计。</p>
+  </section>
+
+  <!-- Tech & trust -->
+  <section class="tile tile-light" id="trust" aria-labelledby="trust-title">
+    <div class="tile-copy">
+      <p class="eyebrow" data-reveal>技术与信任</p>
+      <h2 id="trust-title" class="tile-title" data-reveal>把可靠写进工程。</h2>
+      <p class="lead-airy" data-reveal>三层结构，不绑定任何一家模型。核心是「整片记忆 + 时刻锚定」的上下文，和「哄」的输出纪律。</p>
+    </div>
+    <div class="layers" data-reveal>
+      <div class="layer">
+        <p class="layer-k">01 · 浏览器扩展</p>
+        <h3>看见你停在哪一秒</h3>
+        <p>字幕、前后 30 秒、当前画面、录音。</p>
+        <p class="layer-os">Chrome 与 Safari</p>
+      </div>
+      <div class="wire" aria-hidden="true"><i></i><i></i></div>
+      <div class="layer core">
+        <p class="layer-k">02 · 本机代理 · 核心</p>
+        <h3>整片记忆，讲准这一段</h3>
+        <p>路由、解释、追问、课程重点；本机识字与语音识别。</p>
+        <p class="layer-os">Windows 与 macOS</p>
+      </div>
+      <div class="wire" aria-hidden="true"><i></i><i></i></div>
+      <div class="layer">
+        <p class="layer-k">03 · 任意大模型</p>
+        <h3>模型随你选</h3>
+        <p>任何 OpenAI 兼容的接口都能接，改配置保存即生效。</p>
+        <p class="layer-os">通义 · DeepSeek · 智谱 · OpenAI</p>
+      </div>
+    </div>
+    <div class="promises">
+      <div class="promise" data-reveal style="--d:0ms"><h3>不编造</h3><p>字幕不够就直说没抓全；读到的字幕和这个视频对不上，就弃用。</p></div>
+      <div class="promise" data-reveal style="--d:90ms"><h3>不上传</h3><p>API Key 只在本机代理里，扩展永远拿不到。录音本机识别，用完即丢；学习历史只存在本机浏览器。</p></div>
+      <div class="promise" data-reveal style="--d:180ms"><h3>不白屏</h3><p>任何一层失败都有退路：视觉模型不可用就本机读画面文字，没配 Key 就用关键词规则标重点。</p></div>
+    </div>
+  </section>
+
+  <!-- Audience -->
+  <section class="tile tile-dark-2 on-dark" id="who" aria-labelledby="who-title">
+    <div class="tile-copy">
+      <p class="eyebrow" data-reveal>写给谁</p>
+      <h2 id="who-title" class="tile-title" data-reveal>教育公平的最后一公里，<br>是「有人可以问」。</h2>
+      <p class="lead-airy" data-reveal>屏幕里，名师在讲；屏幕旁，有人哄你听懂。</p>
+    </div>
+    <div class="aud">
+      <div data-reveal style="--d:0ms"><h3>县域与乡村学生</h3><p>好课看得到，难点没人答。</p></div>
+      <div data-reveal style="--d:80ms"><h3>自考、考研的人</h3><p>一个人备考，卡住全靠搜。</p></div>
+      <div data-reveal style="--d:160ms"><h3>在职转行的人</h3><p>下班后学，没有同学和助教。</p></div>
+      <div data-reveal style="--d:240ms"><h3>银发学习者</h3><p>想学新东西，不好意思反复问。</p></div>
+    </div>
+  </section>
+
+  <!-- Install -->
+  <section class="tile tile-light" id="install" aria-labelledby="install-title">
+    <div class="tile-copy">
+      <p class="eyebrow" data-reveal>v1.4.1 · 开源免费</p>
+      <h2 id="install-title" class="tile-title" data-reveal>五步装好，下一节课就能用。</h2>
+      <div class="tile-actions" data-reveal>
+        <a class="btn btn-primary" href="https://github.com/fengqiaoqu/coaxly/archive/refs/heads/main.zip">下载源码</a>
+        <a class="btn btn-secondary" href="https://github.com/fengqiaoqu/coaxly" target="_blank" rel="noopener">查看 GitHub</a>
+      </div>
+      <div class="chips os-switch" role="group" aria-label="选择系统" data-reveal>
+        <button class="chip" type="button" data-os="win" aria-pressed="true">Windows</button>
+        <button class="chip" type="button" data-os="mac" aria-pressed="false">macOS</button>
+      </div>
+    </div>
+    <ol class="steps" id="steps" data-reveal aria-live="polite"></ol>
+    <p class="agent-tip" data-reveal>想让 AI 替你装？把仓库里的 <a class="link" href="https://github.com/fengqiaoqu/coaxly/blob/main/INSTALL.md" target="_blank" rel="noopener">INSTALL.md</a> 交给 Claude Code 或 Codex。</p>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <p class="footer-note">演示中的课程画面与「试一试」为示意，解释内容按产品的三段式规则编写。热力图为规划中功能，图中数据为示意。哄着学原名「学习搭子 / LearnBuddy」，v1.4.1 起更名。</p>
+    <div class="footer-cols">
+      <div>
+        <h4>产品</h4>
+        <ul>
+          <li><a href="#concept">理念</a></li>
+          <li><a href="#video">演示视频</a></li>
+          <li><a href="#try">试一试</a></li>
+          <li><a href="#map">卡点地图</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>文档</h4>
+        <ul>
+          <li><a href="https://github.com/fengqiaoqu/coaxly#readme" target="_blank" rel="noopener">README</a></li>
+          <li><a href="https://github.com/fengqiaoqu/coaxly/blob/main/INSTALL.md" target="_blank" rel="noopener">安装说明</a></li>
+          <li><a href="https://github.com/fengqiaoqu/coaxly/blob/main/README-macOS.md" target="_blank" rel="noopener">macOS 说明</a></li>
+          <li><a href="https://github.com/fengqiaoqu/coaxly/blob/main/CHANGELOG.md" target="_blank" rel="noopener">更新日志</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>开发</h4>
+        <ul>
+          <li><a href="https://github.com/fengqiaoqu/coaxly" target="_blank" rel="noopener">GitHub 仓库</a></li>
+          <li><a href="https://github.com/fengqiaoqu/coaxly/blob/main/提示词工程规格.md" target="_blank" rel="noopener">提示词工程规格</a></li>
+          <li><a href="https://github.com/fengqiaoqu/coaxly/tree/main/prompts" target="_blank" rel="noopener">全部提示词</a></li>
+          <li><a href="https://github.com/fengqiaoqu/coaxly/issues" target="_blank" rel="noopener">反馈问题</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer-legal">
+      <span>哄着学 Coaxly · 别人卷你，我哄你。</span>
+      <span>深圳零一学院 · 社会创新创业马拉松 2026</span>
+    </div>
+  </div>
+</footer>
+
+<script src="main.js"></script>
+</body>
+</html>
