@@ -232,6 +232,15 @@
   if (stepsEl) renderSteps(/Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? 'mac' : 'win');
   if (/Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)) osBtns.forEach(function (x) { x.setAttribute('aria-pressed', String(x.getAttribute('data-os') === 'mac')); });
 
+  /* ---------- BP deck: restart + focus ---------- */
+  var bpBtn = $('#bp-focus'), bpFrame = $('#bp-frame');
+  if (bpBtn && bpFrame) {
+    bpBtn.addEventListener('click', function () {
+      bpFrame.src = 'bp.html';
+      bpFrame.addEventListener('load', function () { try { bpFrame.contentWindow.focus(); } catch (e) {} }, { once: true });
+    });
+  }
+
   /* ---------- Interactive demo ---------- */
   var sim = $('#sim');
   if (!sim) return;
