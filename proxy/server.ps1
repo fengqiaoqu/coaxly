@@ -16,7 +16,7 @@
     POST /asr       语音识别（v1.2：默认 Windows 本机离线识别，可选云端 /audio/transcriptions）
     POST /summarize Call 4：历史节点的一句话说明（v1.2）
     POST /keypoints Call 5：按段读字幕标注课程重点（v1.3；JSON 模式，失败走关键词规则兜底）
-    POST /memory/build    整片字幕 → 后台生成分层记忆（v1.4，见 docs/v1.4-记忆分层-方案.md）
+    POST /memory/build    整片字幕 → 后台生成分层记忆（v1.4）
     GET  /memory/status   ?video_id= 记忆生成进度
     POST /memory/context  调试：看某个时间点实际拼进提示词的四层上下文
 #>
@@ -171,7 +171,7 @@ function Format-History($history) {
   return "`n" + (@($lines) -join "`n")
 }
 
-# ---------------------------------------------------------------- Call 2 输出整理与校验（规格 4.4）
+# ---------------------------------------------------------------- Call 2 输出整理与校验
 function Remove-Markdown([string]$t) {
   if ($null -eq $t) { return '' }
   $t = $t -replace "`r", ''
@@ -438,7 +438,7 @@ function Add-SubtitleToTranscript([string]$transcript, [string]$timestamp, [stri
 
 # ---------------------------------------------------------------- Call 1：路由
 function Get-FallbackRoute([string]$question, [string]$transcript) {
-  # 规格 3.4：问题里的中文与字母连续串 → 2 字滑窗；命中字幕中任意 2 个片段 → in_video
+  # 问题里的中文与字母连续串 → 2 字滑窗；命中字幕中任意 2 个片段 → in_video
   $grams = New-Object 'System.Collections.Generic.HashSet[string]'
   foreach ($m in [regex]::Matches(([string]$question).ToLowerInvariant(), '[一-鿿a-z]+')) {
     $s = $m.Value
@@ -479,7 +479,7 @@ function Invoke-Router($cfg, [hashtable]$vars, [hashtable]$meta) {
     $jsonMode = $true
     $r = Invoke-Chat $cfg ([string]$cfg.model) $sys $vars.question 0 120 @{ response_format = @{ type = 'json_object' } }
     if (-not $r.ok -and $r.status -ge 400 -and @(401, 403, 429) -notcontains $r.status) {
-      # 规格 3.3：上游不支持 JSON 模式 → 去掉 response_format 重试一次
+      # 上游不支持 JSON 模式 → 去掉 response_format 重试一次
       $jsonMode = $false
       $r = Invoke-Chat $cfg ([string]$cfg.model) $sys $vars.question 0 120 $null
     }
@@ -1294,7 +1294,7 @@ function Invoke-Call2Once($cfg, [string]$system, [string]$question, [string]$tex
     )
     $r = Invoke-Chat $cfg ([string]$cfg.visionModel) $system $content $temperature 400 $null
     if ($r.ok) { $r.vision_used = $true; $r.model = [string]$cfg.visionModel; return $r }
-    # 规格 2.4：视觉调用失败 → 自动回落纯文本重试一次（这时用本地文字识别补上画面里的字）
+    # 视觉调用失败 → 自动回落纯文本重试一次（这时用本地文字识别补上画面里的字）
     $visionError = $r.error
     Write-Host ('    视觉调用失败，回落纯文本：' + (Limit-Text $r.error 160)) -ForegroundColor DarkYellow
     if ($textQuestion -eq $question) {
@@ -1414,7 +1414,7 @@ function Invoke-Explain($ctx, $body) {
   $retried = $false
   $retryChars = $null
   if ($m1.chars -gt $CALL2_LIMIT) {
-    # 规格 4.4：超长 → temperature 0.2 + 追加约束，重试一次，更短才采用
+    # 超长 → temperature 0.2 + 追加约束，重试一次，更短才采用
     $retried = $true
     $system2 = $system + "`n`n" + (Read-Prompt 'call2_retry_suffix.md')
     $second = Invoke-Call2Once $cfg $system2 $question $textQuestion $image $visionUsed 0.2
@@ -1508,7 +1508,7 @@ function Invoke-Followup($ctx, $body) {
   $firstMs = $null
   $streamError = $null
   try {
-    # 规格 3.1：首轮追问才路由；同一浮层后续追问沿用结论（由客户端带上 route）
+    # 首轮追问才路由；同一浮层后续追问沿用结论（由客户端带上 route）
     if (-not $route) {
       if ($degraded) {
         $routeInfo = @{ route = 'in_video'; redirect = $null; fallback = $false }

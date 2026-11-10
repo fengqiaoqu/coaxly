@@ -200,7 +200,7 @@ def format_history(history):
     return '\n' + '\n'.join(lines)
 
 
-# ---------------------------------------------------------------- Call 2 输出整理与校验（规格 4.4）
+# ---------------------------------------------------------------- Call 2 输出整理与校验
 def remove_markdown(t):
     if t is None:
         return ''
@@ -464,7 +464,7 @@ def add_subtitle_to_transcript(transcript, timestamp, sub):
 
 # ---------------------------------------------------------------- Call 1：路由
 def fallback_route(question, transcript):
-    """规格 3.4：问题里的中文与字母连续串 → 2 字滑窗；命中字幕中任意 2 个片段 → in_video"""
+    """问题里的中文与字母连续串 → 2 字滑窗；命中字幕中任意 2 个片段 → in_video"""
     grams = set()
     for m in re.finditer(r'[一-鿿a-z]+', str(question or '').lower()):
         s = m.group(0)
@@ -510,7 +510,7 @@ def invoke_router(cfg, variables, meta):
         r = invoke_chat(cfg, str(cfg['model']), sys_prompt, variables['question'], 0, 120,
                         {'response_format': {'type': 'json_object'}})
         if not r['ok'] and r.get('status', 0) >= 400 and r.get('status') not in (401, 403, 429):
-            # 规格 3.3：上游不支持 JSON 模式 → 去掉 response_format 重试一次
+            # 上游不支持 JSON 模式 → 去掉 response_format 重试一次
             json_mode = False
             r = invoke_chat(cfg, str(cfg['model']), sys_prompt, variables['question'], 0, 120, None)
         if r['ok']:
@@ -1816,7 +1816,7 @@ class Handler(BaseHTTPRequestHandler):
                 r['vision_used'] = True
                 r['model_used'] = str(cfg['visionModel'])
                 return r
-            # 规格 2.4：视觉调用失败 → 自动回落纯文本重试一次（这时用本地文字识别补上画面里的字）
+            # 视觉调用失败 → 自动回落纯文本重试一次（这时用本地文字识别补上画面里的字）
             vision_error = r.get('error')
             print('    视觉调用失败，回落纯文本：' + limit_text(vision_error, 160), file=sys.stderr)
             if text_question == question:
@@ -1929,7 +1929,7 @@ class Handler(BaseHTTPRequestHandler):
         retried = False
         retry_chars = None
         if m1['chars'] > CALL2_LIMIT:
-            # 规格 4.4：超长 → temperature 0.2 + 追加约束，重试一次，更短才采用
+            # 超长 → temperature 0.2 + 追加约束，重试一次，更短才采用
             retried = True
             system2 = system + '\n\n' + read_prompt('call2_retry_suffix.md')
             second = self._call2_once(cfg, system2, question, text_question, image, vision_used, 0.2)
@@ -2008,7 +2008,7 @@ class Handler(BaseHTTPRequestHandler):
         first_ms = None
         stream_error = None
         try:
-            # 规格 3.1：首轮追问才路由；同一浮层后续追问沿用结论（由客户端带上 route）
+            # 首轮追问才路由；同一浮层后续追问沿用结论（由客户端带上 route）
             if not route:
                 if degraded:
                     route_info = {'route': 'in_video', 'redirect': None, 'fallback': False}
