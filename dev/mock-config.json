@@ -1,5 +1,5 @@
 {
-  "_说明": "开发自测用：代理连 dev/mock-upstream.js（node dev/mock-upstream.js 9901），端口 8788，日志写 data/dev-calls.jsonl。见 .claude/launch.json 的 mock-upstream / proxy-dev。memory 的小节切得比默认（150 秒 / 900 字）细，8 分钟的样例字幕（dev/test-page.html?full=1）能切出 8 节。",
+  "_说明": "开发自测用：代理连 dev/mock-upstream.js（node dev/mock-upstream.js 9901），端口 8788，日志写 data/dev-calls.jsonl。memory 的小节切得比默认（150 秒 / 900 字）细，8 分钟的样例字幕（dev/test-page.html?full=1）能切出 8 节。",
   "baseUrl": "http://127.0.0.1:9901/v1",
   "apiKey": "mock-key",
   "model": "mock-chat",

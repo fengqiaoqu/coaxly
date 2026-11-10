@@ -1,9 +1,42 @@
 proxy/config.json
 data/
 
-# macOS 适配：编译产物与系统文件（源码 proxy/mac/*.swift 入库，二进制用 build-mac.sh 生成）
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# Build outputs and system files
 proxy/mac/lb-ocr
 proxy/mac/lb-asr
 __pycache__/
 *.pyc
 .DS_Store
+Thumbs.db
+/LearnBuddy.exe
+
+# Private development notes and agent configuration
+/.claude/
+/.codex/
+/.agents/
+/AGENTS.md
+/CLAUDE.md
+/task_plan.md
+/notes.md
+/CONVERGE-V2.md
+/提示词工程规格.md
+/安装过程与排障记录.md
+/部署与使用说明.md
+/docs/v1.2-方案.md
+/docs/v1.2-规格变更.md
+/docs/v1.3-方案.md
+/docs/v1.4-记忆分层-方案.md
+
+# Local copies, presentation exports and recordings
+/learn-buddy/
+/*.zip
+/v1.0.mp4
+/261109提交demo/
+/全部原始采集帧/
+/团队页修改备份_20261109/
+/团队页检查_20261109/

@@ -13,7 +13,7 @@
  * - 历史节点：每次求助记一个节点（由扩展后台写入），带一句话说明；选节点 = 视频跳回去 + 还原当时的对话，可接着追问。
  *
  * v1.3：
- * - 界面重新设计：暖象牙白 + 陶土橙 + 衬线正文 + 细线（docs/v1.3-方案.md 第一章）。
+ * - 界面：衬线正文、深浅色模式与进度条重点标记。
  * - 课程重点：读完整字幕（B 站字幕接口，带用户自己的登录态）或边播边攒的字幕，分段交给本地代理 /keypoints（Call 5）
  *   判定重点 → 进度条标记 + 抽屉「重点」列表 + 播放经过时提示 + 暂停时「附近重点」。存在 chrome.storage.local 的 kp:<视频ID>。
  */
@@ -24,9 +24,9 @@
 
   // ------------------------------------------------------------------ 常量
   const DEFAULT_QUESTION = '这里没听懂，帮我讲讲刚才这一段';
-  const WINDOW_SEC = 30;          // 规格 2.2：±30 秒字幕窗口
-  const MIN_VOICE_CHARS = 4;      // 规格 6：首个 partial ≥4 字就可以发起
-  const VAD_SILENCE_MS = 700;     // 规格 6：静音判定不要设长
+  const WINDOW_SEC = 30;          // ±30 秒字幕窗口
+  const MIN_VOICE_CHARS = 4;      // 有效语音文字的最小长度
+  const VAD_SILENCE_MS = 700;     // 静音结束判定时长
   const MAX_ENTRIES = 6000;
   const HARDSUB_EVERY_MS = 1500;  // 播放时每隔多久读一次画面底部的硬字幕
   const HARDSUB_STRIP = 0.25;     // 读画面底部多高的一条（占画面高度）
@@ -215,7 +215,7 @@
     return clip(parts.join(' / '), 120) || '未知课程';
   }
 
-  // ------------------------------------------------------------------ 字幕采集器（规格 2.2）
+  // ------------------------------------------------------------------ 字幕采集器
   let observer = null;
   let scanTimer = 0;
 
@@ -599,7 +599,7 @@
     ui.showAsk(v, { noSubs, histCount: state.hist.nodes.length, kpNear: kpNear(v.currentTime) });
   }
 
-  // ------------------------------------------------------------------ 求助记录（规格 2.3 的 past3）
+  // ------------------------------------------------------------------ 求助记录（最近三次求助）
   function loadPast(videoId) {
     return new Promise((resolve) => {
       try {
@@ -1338,7 +1338,7 @@
       transcript: s.transcript,
       question: s.question,
       past,
-      route: 'in_video', // 规格 3.1：按钮路径跳过 Call 1，路由恒定 in_video
+      route: 'in_video', // 按钮路径跳过 Call 1，路由恒定 in_video
       trigger: s.trigger,
       image,
     });
@@ -1436,7 +1436,7 @@
       timestamp: s.timestamp,
       call2_ok: !!s.call2,
       turns: s.turns.length,
-      user_closed_without_followup: !!s.call2 && s.turns.length === 0, // 规格 8：最关键指标
+      user_closed_without_followup: !!s.call2 && s.turns.length === 0, // 记录未追问即关闭的会话
       open_ms: Date.now() - s.openedAt,
       mode: state.settings.mode,
       node_id: s.call2 ? s.nodeId : null,
@@ -1452,7 +1452,7 @@
     ui.closeDrawer();
   }
 
-  // ------------------------------------------------------------------ 语音追问（规格 6；v1.2 改为本机识别）
+  // ------------------------------------------------------------------ 语音追问（本机识别）
   // v1.1 用的 Chrome 自带识别（webkitSpeechRecognition）要把声音发到 Google，国内连不上，语音完全不可用。
   // v1.2 默认：页面里录音（16kHz 单声道）+ 本地静音检测 → WAV 发给本地代理 /asr → Windows 离线识别 → 自动发出追问。
   // 设置页可以切回「浏览器自带」（能访问 Google 时可用）。
@@ -2706,7 +2706,7 @@ button.chip:hover .dia { background: #fdf9ee; }
     };
   })();
 
-  // ------------------------------------------------------------------ 快捷键 1（规格 10：暂停 → 中央按钮 / 1 快捷键）
+  // ------------------------------------------------------------------ 快捷键 1（暂停 → 中央按钮 / 1 快捷键）
   window.addEventListener('keydown', (e) => {
     // Esc 关抽屉：焦点在哪都生效（按 1 呼出后焦点还在页面上）；但用户在 B 站自己的输入框里按 Esc 不抢
     if (e.key === 'Escape') {
